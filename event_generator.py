@@ -93,19 +93,24 @@ def call_gemini_api(system_instruction: str, user_prompt: str) -> dict:
     else:
         raise Exception(f"Gemini API error {response.status_code}: {response.text}")
 
-def generate_events(news_file="news_database.json", assets_file="assets.json", max_events=15):
+def generate_events(news_file="news_database.json", assets_file="assets.json", max_events=15, articles=None):
     try:
-        with open(news_file, 'r') as f:
-            news_data = json.load(f)
         with open(assets_file, 'r') as f:
             universe = json.load(f)
     except Exception as e:
         print(f"Error loading files: {e}")
-        return
+        return False
 
-    articles = []
-    for cat, items in news_data.get("categories", {}).items():
-        articles.extend(items)
+    if articles is None:
+        try:
+            with open(news_file, 'r') as f:
+                news_data = json.load(f)
+            articles = []
+            for cat, items in news_data.get("categories", {}).items():
+                articles.extend(items)
+        except Exception as e:
+            print(f"Error loading news file: {e}")
+            return False
 
     # ---------------------------------------------------------
     # OPTIMIZATION: Only process articles with a score >= 0.8
@@ -116,7 +121,7 @@ def generate_events(news_file="news_database.json", assets_file="assets.json", m
 
     if not top_articles:
         print("No articles with score >= 0.8 found. Exiting pipeline.")
-        return
+        return False
 
     articles_lite = [{"url": a["url"], "title": a["title"], "snippet": a["snippet"], "source": a["source"]} for a in top_articles]
 
@@ -281,13 +286,17 @@ DESCRIPTION RULES
 - Final sentence MUST state precise binary resolution terms: specific price level, direction, and weekly timeframe
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WORTHY GATE
+WORTHY GATE & EVALUATION LAYER
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Set worthy=false if ANY of the following apply:
-- No tradable Basket can be built from this trend
-- Title cannot meet all rules above
-- Description cannot meet all rules above
-- Honest tradability_score is below 0.80
+Evaluate the event strictly across four pillars:
+1. Validation Check: Is the source credible and unique?
+2. Tradability Check: Does the trend have clear, actionable market relevance for a specific asset?
+3. Virality Check: Is there measurable trend strength, engagement, or social/news momentum?
+4. Worthiness Assessment: Is this event important enough for downstream trading?
+
+If ALL four pillars pass, set decision_approved=true. Otherwise, decision_approved=false.
+Set worthy=false if decision_approved=false, OR if any title/description rules fail.
+Honest tradability_score MUST be above 0.80 to be worthy.
 
 CAUSAL CHAIN: Provide a compact "Real-World Trigger -> Market Mechanism -> Asset Direction" string."""
 
@@ -329,6 +338,11 @@ TITLE REMINDER — follow this pattern exactly:
 Output strict JSON matching schema:
 {{
   "source_story_id": "{url}",
+  "validation_check": true,
+  "tradability_check": true,
+  "virality_check": true,
+  "worthiness_assessment": true,
+  "decision_approved": true,
   "worthy": true,
   "title": "<[Subject] + [reaction] + [Could/May/Likely to + direction] — plain English, no tickers, no price targets>",
   "causal_chain": "<Real-World Trigger -> Market Mechanism -> Asset Direction>",
@@ -346,10 +360,11 @@ Output strict JSON matching schema:
                     score = parse_tradability_score(event_obj.get("tradability_score"))
                     event_obj["tradability_score"] = score
                     worthy = event_obj.get("worthy", True)
-                    if worthy and score >= 0.80:
+                    decision = event_obj.get("decision_approved", True)
+                    if worthy and decision and score >= 0.80:
                         final_events.append(event_obj)
                     else:
-                        print(f"     [~] Dropped low-quality event for {ticker} (worthy={worthy}, score={score:.2f}): {event_obj.get('title', '')[:80]}")
+                        print(f"     [~] Dropped low-quality event for {ticker} (worthy={worthy}, decision={decision}, score={score:.2f}): {event_obj.get('title', '')[:80]}")
             except Exception as e:
                 print(f"     [!] Failed to generate isolated event for {ticker}: {e}")
 
@@ -425,6 +440,8 @@ Output strict JSON matching schema:
                 failed += 1
 
         print(f"\nPush complete: {pushed} succeeded, {failed} failed.")
+
+    return True
 
 if __name__ == "__main__":
     generate_events()

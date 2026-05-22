@@ -142,6 +142,8 @@ def run_aggregation(args):
     else:
         print(json_output)
 
+    return output_data
+
 def main():
     parser = argparse.ArgumentParser(
         description="Scrapes, ranks, and classifies news articles for prediction market databases."
