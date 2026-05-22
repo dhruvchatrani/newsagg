@@ -1,8 +1,17 @@
 import json
 import re
+import os
 import requests
+from pathlib import Path
 from datetime import datetime, timezone
+from dotenv import load_dotenv
 import config
+
+_env_path = Path(__file__).resolve().parent / '.env'
+load_dotenv(dotenv_path=_env_path, override=True)
+
+CASCADE_API_URL = os.getenv("CASCADE_API_URL", "http://localhost:8800/api/admin/markets/from-prompt").strip()
+ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "").strip()
 
 def chunk_list(lst, n):
     for i in range(0, len(lst), n):
@@ -39,6 +48,22 @@ def clean_and_parse_json(text: str):
         if text.endswith("```"):
             text = text[:-3].strip()
     return json.loads(text)
+
+def parse_tradability_score(value) -> float:
+    """Coerce LLM tradability_score (float, int, or string) to a float in [0, 1]."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, float(value)))
+    if isinstance(value, str):
+        s = value.strip()
+        if not s or s.startswith("<"):
+            return 0.0
+        try:
+            return max(0.0, min(1.0, float(s)))
+        except ValueError:
+            return 0.0
+    return 0.0
 
 def call_gemini_api(system_instruction: str, user_prompt: str) -> dict:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={config.GEMINI_API_KEY}"
@@ -97,8 +122,20 @@ def generate_events(news_file="news_database.json", assets_file="assets.json", m
 
     universe_str = ", ".join(universe)
 
-    system_prompt_base = f"""You are an expert quantitative prediction-market AI system. 
-You strictly communicate by returning raw JSON arrays matching the requested schemas. No prose, no markdown formatting blocks.
+    system_prompt_base = f"""You are a prediction-market event builder for Cascade, a platform where users take Buy/Sell positions on real-world trends.
+
+You strictly communicate by returning raw JSON matching the requested schemas. No prose, no markdown.
+
+CORE RULE — TRADABILITY GATE:
+An event may ONLY be created if the underlying trend can be mapped to at least one instrument that can form a tradable Basket:
+- FX pairs (e.g. USDJPY, EURUSD)
+- Commodities (e.g. Oil, Gold, Natural Gas, Wheat, Copper)
+- Crypto assets (e.g. BTC, ETH, SOL)
+- Indices (e.g. S&P 500, NASDAQ, Nikkei)
+- ETFs or Sector baskets (e.g. Defense ETF, Energy, Semiconductors, Cybersecurity)
+- Country or region baskets
+- Publicly traded companies with direct exposure to the trend
+If no tradable Basket can be constructed from the news, the event must be REJECTED.
 
 Valid Asset Universe:
 {universe_str}"""
@@ -110,7 +147,23 @@ Valid Asset Universe:
     batched_articles = list(chunk_list(articles_lite, 5))
     all_triaged_mappings = []
 
-    pass1_system_instruction = system_prompt_base + "\n\nTask: Filter incoming news batches for discrete, datable future outcomes that drive clear directional price movements for assets in the universe. Reject commentary or fully priced-in stories. For surviving stories, return their exact URL and an array of mapped assets from the universe with a 1-sentence directional thesis."
+    pass1_system_instruction = system_prompt_base + """
+
+Task: Filter incoming news batches for real-world trends that meet the Tradability Gate AND have a clear directional impact on a Basket of instruments from the universe.
+
+HARD REJECT — return NO mapping for any article that:
+- Cannot be mapped to a tradable Basket (FX, Commodity, Crypto, Index, ETF, Sector, Company)
+- Is vague macro commentary with no specific named event, actor, or decision
+- Describes a trend already fully priced in with no new catalyst
+- Is speculative opinion or analyst note without a firm near-term trigger
+- Duplicates a story already mapped in this batch — keep only the strongest version
+
+ACCEPT only stories where:
+- A clear real-world trend or named event is unfolding (geopolitical, economic, corporate, policy)
+- At least one instrument in the universe has direct mechanistic exposure to that trend
+- The market direction (up or down pressure) is reasonably clear from the story
+
+For each surviving story, return its exact URL and the mapped assets with a 1-sentence directional thesis."""
 
     for index, batch in enumerate(batched_articles):
         print(f" -> Processing Batch {index + 1}/{len(batched_articles)}...")
@@ -184,10 +237,59 @@ Valid Asset Universe:
     print("PASS 2: Generating catalyst-driven narrative events via isolated single-story chat targets...")
     final_events = []
 
-    pass2_system_instruction = system_prompt_base + """\n\nTask: Build a catalyst-driven prediction market event for an isolated target story.
-- TITLE RULES: BANNED from using absolute price targets or percentages. BANNED from using "Will X cross Y by Z". MUST use natural, organic phrasing naming the explicit news trigger and directional trend.
-- DESCRIPTION RULES: Minimum 5 sentences. Extract deep facts, specific metrics, or names from the snippet. Explain the complete operational linkage mechanism. Final sentence must define clean resolution terms relative to today's price context.
-- CAUSAL CHAIN RULE: Provide a compact "News Event -> Market Mechanism -> Asset Direction" flow string."""
+    pass2_system_instruction = system_prompt_base + """
+
+Task: Build a single Cascade prediction-market event for an isolated target story.
+It is better to reject with worthy=false than to generate a mediocre event.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TITLE PHILOSOPHY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The title is what a user reads before deciding to Buy or Sell.
+It must NOT sound like a financial research headline or an analyst report.
+It must sound like a plain-English market intuition a smart person would say.
+
+TITLE PATTERN:
+  [Country / Region / Trend / Named Actor] + [market or behavior reaction] + [natural direction phrase]
+
+GOOD EXAMPLES (use this register and style):
+  - Middle East Tension Could Push Oil Higher
+  - US-China Tariff Escalation Could Weaken Asian Supply Chains
+  - Japan Fiscal Concerns Could Pressure JPY Lower
+  - Fed Rate Uncertainty Could Keep Gold Elevated
+  - Iran Conflict Risk Could Lift Defense Spending
+  - Meta Workforce Cuts Could Expand Operating Margins
+  - Red Sea Disruption Could Keep Shipping Costs High
+  - AI Copyright Pressure Could Raise Content Licensing Costs
+  - Trump AI Security Order Could Benefit Cloud Security Leaders
+
+TITLE RULES — all must hold or set worthy=false:
+- Use the pattern above: subject + reaction + direction
+- Direction phrase MUST use soft modal language: "Could", "May", "Likely to" — NOT "Will"
+- BANNED openers: "Market Reaction to", "Impact of", "Effect of", "Outlook for", "Analysis of"
+- BANNED: price targets, percentages, "Cross X by Y", ticker symbols in the title
+- The subject MUST be a real named entity, country, region, trend, or sector — not a generic placeholder
+- A reader should instantly understand: What is happening? Which way is the market likely to move?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DESCRIPTION RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Minimum 5 dense, information-rich sentences — no filler or padding
+- MUST cite at least 2 concrete facts from the snippet: named individuals, dollar amounts, percentages, vote counts, dates, or specific data points
+- MUST explain the step-by-step mechanism: how the real-world event flows through to the asset price
+- MUST NOT invent numbers or claims not present in the snippet or price context
+- Final sentence MUST state precise binary resolution terms: specific price level, direction, and weekly timeframe
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WORTHY GATE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Set worthy=false if ANY of the following apply:
+- No tradable Basket can be built from this trend
+- Title cannot meet all rules above
+- Description cannot meet all rules above
+- Honest tradability_score is below 0.80
+
+CAUSAL CHAIN: Provide a compact "Real-World Trigger -> Market Mechanism -> Asset Direction" string."""
 
     for item in valid_mappings:
         url = item.get("source_story_id")
@@ -216,24 +318,38 @@ Target Asset Mapping:
 - Preliminary Directional Thesis: {thesis}
 - Current Web Price Context: {asset_price_info}
 
+Apply ALL title, description, and worthy rules from the system instruction before writing your response.
+If ANY quality gate fails, still return the full JSON but set worthy=false with your honest tradability_score.
+
+TITLE REMINDER — follow this pattern exactly:
+  [Country/Region/Trend/Named Actor] + [market or behavior reaction] + [soft directional phrase: Could/May/Likely to]
+  Example: "Meta Workforce Cuts Could Expand Operating Margins"
+  NOT: "Market Reaction to Meta's Layoffs" or "Impact of Meta Cost Reduction"
+
 Output strict JSON matching schema:
 {{
   "source_story_id": "{url}",
-  "title": "<organic catalyst directional question>",
-  "causal_chain": "<A -> B -> C mechanism flow string>",
-  "description": "<5+ sentences rich context, clear linkage, and concrete resolution terms>",
+  "worthy": true,
+  "title": "<[Subject] + [reaction] + [Could/May/Likely to + direction] — plain English, no tickers, no price targets>",
+  "causal_chain": "<Real-World Trigger -> Market Mechanism -> Asset Direction>",
+  "description": "<5+ dense sentences: 2+ named facts from snippet, mechanism explanation, binary resolution terms with specific price and weekly timeframe>",
   "linked_assets": ["{ticker}"],
-  "directional_impact": "{asset_obj.get('directional_impact', 'Bullish')}",
+  "directional_impact": "<Bullish|Bearish|Volatile>",
   "category": "Macroeconomics",
   "horizon": "weekly",
-  "tradability_score": 0.90
+  "tradability_score": "<honest float 0.0-1.0>"
 }}"""
 
             try:
                 event_obj = call_gemini_api(pass2_system_instruction, isolated_user_prompt)
                 if isinstance(event_obj, dict):
-                    if event_obj.get("tradability_score", 0) >= 0.60:
+                    score = parse_tradability_score(event_obj.get("tradability_score"))
+                    event_obj["tradability_score"] = score
+                    worthy = event_obj.get("worthy", True)
+                    if worthy and score >= 0.80:
                         final_events.append(event_obj)
+                    else:
+                        print(f"     [~] Dropped low-quality event for {ticker} (worthy={worthy}, score={score:.2f}): {event_obj.get('title', '')[:80]}")
             except Exception as e:
                 print(f"     [!] Failed to generate isolated event for {ticker}: {e}")
 
@@ -246,10 +362,17 @@ Output strict JSON matching schema:
         if not assets:
             continue
         key = f"{assets[0]}_{event.get('horizon', 'weekly')}"
-        if key not in deduped_map or event.get("tradability_score", 0) > deduped_map[key].get("tradability_score", 0):
+        event_score = parse_tradability_score(event.get("tradability_score"))
+        event["tradability_score"] = event_score
+        existing_score = parse_tradability_score(deduped_map[key].get("tradability_score")) if key in deduped_map else 0.0
+        if key not in deduped_map or event_score > existing_score:
             deduped_map[key] = event
 
-    unique_events = sorted(list(deduped_map.values()), key=lambda x: x.get("tradability_score", 0), reverse=True)
+    unique_events = sorted(
+        list(deduped_map.values()),
+        key=lambda x: parse_tradability_score(x.get("tradability_score")),
+        reverse=True,
+    )
     sliced_events = unique_events[:max_events]
 
     output_data = {
@@ -264,7 +387,44 @@ Output strict JSON matching schema:
     with open("prediction_events.json", "w", encoding="utf-8") as f:
         json.dump(output_data, f, indent=2)
 
-    print(f"Pipeline completely successful! Caching optimizations saved {len(sliced_events)} grounded events.")
+    print(f"Pipeline complete. {len(sliced_events)} grounded events saved.")
+
+    # ========================================================
+    # PUSH: Send each worthy event to the Cascade API
+    # ========================================================
+    if sliced_events:
+        print(f"\nPUSHING {len(sliced_events)} events to Cascade API...")
+        push_headers = {"Content-Type": "application/json"}
+        if ADMIN_API_TOKEN:
+            push_headers["Authorization"] = f"Bearer {ADMIN_API_TOKEN}"
+
+        pushed, failed = 0, 0
+        for event in sliced_events:
+            title = event.get("title", "")
+            description = event.get("description", "")
+            if not title:
+                continue
+            payload = {
+                "title": title,
+                "description": description,
+                "basketSize": 4,
+                "source": "quantum",
+                "depth": "low",
+                "brokerMode": "mock"
+            }
+            try:
+                resp = requests.post(CASCADE_API_URL, json=payload, headers=push_headers, timeout=30)
+                if resp.status_code in [200, 201]:
+                    print(f"  [+] Pushed: {title[:90]}")
+                    pushed += 1
+                else:
+                    print(f"  [x] Failed ({resp.status_code}): {title[:90]}")
+                    failed += 1
+            except Exception as e:
+                print(f"  [!] Error pushing '{title[:80]}': {e}")
+                failed += 1
+
+        print(f"\nPush complete: {pushed} succeeded, {failed} failed.")
 
 if __name__ == "__main__":
     generate_events()
