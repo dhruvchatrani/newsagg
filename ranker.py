@@ -2,8 +2,7 @@ from datetime import datetime, timezone
 import json
 import re
 from typing import List, Dict, Any
-from google import genai
-from google.genai import types
+import requests
 
 import config
 
@@ -121,7 +120,147 @@ class PredictionMarketRanker:
         scored_articles.sort(key=lambda x: x["score"], reverse=True)
         return scored_articles
 
-    def evaluate_with_gemini(self, articles: List[Dict[str, Any]], api_key: str) -> List[Dict[str, Any]]:
+    # def evaluate_with_ollama(self, articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    #     if not articles:
+    #         return []
+    # 
+    #     batch_size = 10
+    #     scored_articles = []
+    # 
+    #     pre_scored_list = []
+    #     for index, art in enumerate(articles):
+    #         pre_scored_list.append({"article": art, "index": index})
+    # 
+    #     for i in range(0, len(pre_scored_list), batch_size):
+    #         batch = pre_scored_list[i:i+batch_size]
+    # 
+    #         articles_text = ""
+    #         for item in batch:
+    #             art = item["article"]
+    #             articles_text += (
+    #                 f"Index: {item['index']}\n"
+    #                 f"Title: {art.get('title')}\n"
+    #                 f"Source: {art.get('source')}\n"
+    #                 f"Snippet: {art.get('snippet')}\n"
+    #                 f"-----------------\n"
+    #             )
+    # 
+    #         prompt = f"""You are a senior prediction-market analyst triaging news for an event-creation pipeline.
+    # Your job: score each article on how useful it is for generating tradable binary prediction events on financial assets.
+    # 
+    # Context: The target asset universe includes US/UK/EU Equities, Major FX pairs, Crypto, and major Commodities. Do not highly rank stories that cannot map to these.
+    # 
+    # For each article, output:
+    # 1. category — exactly one of: Politics, Economics & Macro, Crypto & Web3, Geopolitics, Tech & AI, Science & Health, Sports, Pop Culture & Entertainment, Other
+    # 2. prediction_relevance — float in [0.0, 1.0].
+    #    - 0.85–1.00: Hard catalyst with clear asset path (e.g., Fed decision, M&A).
+    #    - 0.60–0.84: Strong macro/geopolitical impact with proxy assets.
+    #    - 0.35–0.59: Soft signal, indirect path.
+    #    - 0.10–0.34: Generic coverage, soft news.
+    #    - 0.00–0.09: Un-tradable lifestyle/entertainment.
+    # 3. reason — one sentence stating the catalyst and likely asset path.
+    # 
+    # OUTPUT RULES:
+    # - Return ONLY a valid JSON array. No markdown fences.
+    # - One object per input article.
+    # 
+    # Articles to evaluate:
+    # {articles_text}
+    # 
+    # Schema:
+    # [
+    #   {{
+    #     "index": <int>,
+    #     "category": "<one of the 9 categories>",
+    #     "prediction_relevance": <float 0.0-1.0>,
+    #     "reason": "<one sentence>"
+    #   }}
+    # ]"""
+    # 
+    #         url = f"{config.OLLAMA_BASE_URL}/api/generate"
+    #         payload = {
+    #             "model": config.OLLAMA_MODEL,
+    #             "prompt": prompt,
+    #             "stream": False,
+    #             "format": "json",
+    #             "options": {
+    #                 "num_ctx": 4096
+    #             }
+    #         }
+    # 
+    #         try:
+    #             response = requests.post(url, json=payload, timeout=300)
+    #             if response.status_code == 200:
+    #                 resp_json = response.json()
+    #                 
+    #                 # Robust parsing helper
+    #                 def parse_ollama_json(resp):
+    #                     text = resp.get("response", "").strip()
+    #                     if not text:
+    #                         text = resp.get("thinking", "").strip()
+    #                     if not text and "message" in resp:
+    #                         msg = resp["message"]
+    #                         text = msg.get("content", "").strip()
+    #                         if not text:
+    #                             text = msg.get("thinking", "").strip()
+    #                     if not text:
+    #                         raise ValueError("Empty response/thinking from Ollama.")
+    #                     
+    #                     text = text.strip()
+    #                     array_match = re.search(r'\[.*\]', text, re.DOTALL)
+    #                     if array_match:
+    #                         text = array_match.group(0)
+    #                     else:
+    #                         object_match = re.search(r'\{.*\}', text, re.DOTALL)
+    #                         if object_match:
+    #                             text = object_match.group(0)
+    #                     return json.loads(text)
+    # 
+    #                 ollama_results = parse_ollama_json(resp_json)
+    #                 results_map = {}
+    #                 if isinstance(ollama_results, list):
+    #                     for res in ollama_results:
+    #                         if isinstance(res, dict) and "index" in res:
+    #                             results_map[res["index"]] = res
+    #                 elif isinstance(ollama_results, dict):
+    #                     for k, res in ollama_results.items():
+    #                         if isinstance(res, dict):
+    #                             match = re.search(r'\d+', k)
+    #                             if match:
+    #                                 idx = int(match.group())
+    #                                 results_map[idx] = res
+    # 
+    #                 for item in batch:
+    #                     idx = item["index"]
+    #                     res = results_map.get(idx, {})
+    #                     
+    #                     category = res.get("category", "Other")
+    #                     if category not in config.PREDICTION_MARKET_INDUSTRIES:
+    #                         category = "Other"
+    # 
+    #                     relevance_score = float(res.get("prediction_relevance", 0.5))
+    #                     relevance_score = max(0.0, min(1.0, relevance_score))
+    # 
+    #                     scored_art = item["article"].copy()
+    #                     scored_art.update({
+    #                         "industry": category,
+    #                         "score": round(relevance_score, 3), 
+    #                         "reason": res.get("reason", "Scored using Ollama analysis."),
+    #                         "ranking_method": "ollama-llm"
+    #                     })
+    #                     scored_articles.append(scored_art)
+    #             else:
+    #                 fallback = self.calculate_rule_based_scores([i["article"] for i in batch])
+    #                 scored_articles.extend(fallback)
+    #         except Exception as e:
+    #             print(f"Ollama request failed: {e}")
+    #             fallback = self.calculate_rule_based_scores([i["article"] for i in batch])
+    #             scored_articles.extend(fallback)
+    # 
+    #     scored_articles.sort(key=lambda x: x["score"], reverse=True)
+    #     return scored_articles
+
+    def evaluate_with_gemini(self, articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not articles:
             return []
 
@@ -131,12 +270,6 @@ class PredictionMarketRanker:
         pre_scored_list = []
         for index, art in enumerate(articles):
             pre_scored_list.append({"article": art, "index": index})
-
-        try:
-            client = genai.Client(api_key=api_key)
-        except Exception as e:
-            print(f"Error initializing GenAI Client: {e}. Falling back to rule-based.")
-            return self.calculate_rule_based_scores(articles)
 
         for i in range(0, len(pre_scored_list), batch_size):
             batch = pre_scored_list[i:i+batch_size]
@@ -159,12 +292,7 @@ Context: The target asset universe includes US/UK/EU Equities, Major FX pairs, C
 
 For each article, output:
 1. category — exactly one of: Politics, Economics & Macro, Crypto & Web3, Geopolitics, Tech & AI, Science & Health, Sports, Pop Culture & Entertainment, Other
-2. prediction_relevance — float in [0.0, 1.0]. Composite of:
-   a) Event-driven: Does it point to a discrete, datable future outcome?
-   b) Asset-linkable: Can it be tied to a publicly tradable asset or a clean macro proxy?
-   c) Magnitude: Would the outcome move price by more than noise?
-   d) Freshness: Is this new information, not stale or fully priced-in?
-   Anchors:
+2. prediction_relevance — float in [0.0, 1.0].
    - 0.85–1.00: Hard catalyst with clear asset path (e.g., Fed decision, M&A).
    - 0.60–0.84: Strong macro/geopolitical impact with proxy assets.
    - 0.35–0.59: Soft signal, indirect path.
@@ -173,8 +301,8 @@ For each article, output:
 3. reason — one sentence stating the catalyst and likely asset path.
 
 OUTPUT RULES:
-- Return ONLY a JSON array. No markdown fences.
-- One object per input article, in the EXACT same order as input. Count must match input count.
+- Return ONLY a valid JSON array. No markdown fences.
+- One object per input article.
 
 Articles to evaluate:
 {articles_text}
@@ -189,40 +317,74 @@ Schema:
   }}
 ]"""
 
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={config.GEMINI_API_KEY}"
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": prompt}
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "responseMimeType": "application/json"
+                }
+            }
+
             try:
-                response = client.models.generate_content(
-                    model="gemini-3.1-flash-lite",
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json"
-                    )
-                )
-                
-                text_response = response.text
-                gemini_results = json.loads(text_response)
-                results_map = {res["index"]: res for res in gemini_results}
-
-                for item in batch:
-                    idx = item["index"]
-                    res = results_map.get(idx, {})
+                response = requests.post(url, json=payload, headers=headers, timeout=60)
+                if response.status_code == 200:
+                    resp_json = response.json()
+                    text = resp_json["candidates"][0]["content"]["parts"][0]["text"].strip()
                     
-                    gemini_category = res.get("category", "Other")
-                    if gemini_category not in config.PREDICTION_MARKET_INDUSTRIES:
-                        gemini_category = "Other"
+                    # Robust cleaning and parsing
+                    if text.startswith("```"):
+                        newline_idx = text.find("\n")
+                        if newline_idx != -1:
+                            text = text[newline_idx:].strip()
+                        if text.endswith("```"):
+                            text = text[:-3].strip()
 
-                    relevance_score = float(res.get("prediction_relevance", 0.5))
-                    relevance_score = max(0.0, min(1.0, relevance_score))
+                    gemini_results = json.loads(text)
+                    results_map = {}
+                    if isinstance(gemini_results, list):
+                        for res in gemini_results:
+                            if isinstance(res, dict) and "index" in res:
+                                results_map[res["index"]] = res
+                    elif isinstance(gemini_results, dict):
+                        for k, res in gemini_results.items():
+                            if isinstance(res, dict):
+                                match = re.search(r'\d+', k)
+                                if match:
+                                    idx = int(match.group())
+                                    results_map[idx] = res
 
-                    scored_art = item["article"].copy()
-                    scored_art.update({
-                        "industry": gemini_category,
-                        "score": round(relevance_score, 3), # Trusting LLM's full composite score
-                        "reason": res.get("reason", "Scored using Gemini LLM analysis."),
-                        "ranking_method": "gemini-llm"
-                    })
-                    scored_articles.append(scored_art)
+                    for item in batch:
+                        idx = item["index"]
+                        res = results_map.get(idx, {})
+                        
+                        category = res.get("category", "Other")
+                        if category not in config.PREDICTION_MARKET_INDUSTRIES:
+                            category = "Other"
+
+                        relevance_score = float(res.get("prediction_relevance", 0.5))
+                        relevance_score = max(0.0, min(1.0, relevance_score))
+
+                        scored_art = item["article"].copy()
+                        scored_art.update({
+                            "industry": category,
+                            "score": round(relevance_score, 3), 
+                            "reason": res.get("reason", "Scored using Gemini analysis."),
+                            "ranking_method": "gemini-llm"
+                        })
+                        scored_articles.append(scored_art)
+                else:
+                    print(f"Gemini API returned error status {response.status_code}: {response.text}")
+                    fallback = self.calculate_rule_based_scores([i["article"] for i in batch])
+                    scored_articles.extend(fallback)
             except Exception as e:
-                print(f"Gemini API request failed for batch: {e}. Falling back to rule-based ranking.")
+                print(f"Gemini request failed: {e}")
                 fallback = self.calculate_rule_based_scores([i["article"] for i in batch])
                 scored_articles.extend(fallback)
 

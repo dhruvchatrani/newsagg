@@ -1,7 +1,72 @@
 import json
+import re
 import requests
 from datetime import datetime, timezone
 import config
+
+def chunk_list(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+# def parse_ollama_json(resp):
+#     text = resp.get("response", "").strip()
+#     if not text:
+#         text = resp.get("thinking", "").strip()
+#     if not text and "message" in resp:
+#         msg = resp["message"]
+#         text = msg.get("content", "").strip()
+#         if not text:
+#             text = msg.get("thinking", "").strip()
+#     if not text:
+#         raise ValueError("Empty response/thinking from Ollama.")
+#     
+#     text = text.strip()
+#     array_match = re.search(r'\[.*\]', text, re.DOTALL)
+#     if array_match:
+#         text = array_match.group(0)
+#     else:
+#         object_match = re.search(r'\{.*\}', text, re.DOTALL)
+#         if object_match:
+#             text = object_match.group(0)
+#     return json.loads(text)
+
+def clean_and_parse_json(text: str):
+    text = text.strip()
+    if text.startswith("```"):
+        newline_idx = text.find("\n")
+        if newline_idx != -1:
+            text = text[newline_idx:].strip()
+        if text.endswith("```"):
+            text = text[:-3].strip()
+    return json.loads(text)
+
+def call_gemini_api(system_instruction: str, user_prompt: str) -> dict:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={config.GEMINI_API_KEY}"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "systemInstruction": {
+            "parts": [
+                {"text": system_instruction}
+            ]
+        },
+        "contents": [
+            {
+                "parts": [
+                    {"text": user_prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json"
+        }
+    }
+    response = requests.post(url, json=payload, headers=headers, timeout=60)
+    if response.status_code == 200:
+        resp_json = response.json()
+        text = resp_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return clean_and_parse_json(text)
+    else:
+        raise Exception(f"Gemini API error {response.status_code}: {response.text}")
 
 def generate_events(news_file="news_database.json", assets_file="assets.json", max_events=15):
     try:
@@ -17,192 +82,189 @@ def generate_events(news_file="news_database.json", assets_file="assets.json", m
     for cat, items in news_data.get("categories", {}).items():
         articles.extend(items)
 
-    articles = sorted(articles, key=lambda x: x.get("score", 0), reverse=True)
-    top_articles = articles[:100]
+    # ---------------------------------------------------------
+    # OPTIMIZATION: Only process articles with a score >= 0.8
+    # ---------------------------------------------------------
+    high_value_articles = [a for a in articles if a.get("score", 0) >= 0.8]
+    high_value_articles = sorted(high_value_articles, key=lambda x: x.get("score", 0), reverse=True)
+    top_articles = high_value_articles[:50] # Hard cap just in case
+
+    if not top_articles:
+        print("No articles with score >= 0.8 found. Exiting pipeline.")
+        return
+
     articles_lite = [{"url": a["url"], "title": a["title"], "snippet": a["snippet"], "source": a["source"]} for a in top_articles]
 
     universe_str = ", ".join(universe)
 
-    if not config.GEMINI_API_KEY:
-        print("Error: GEMINI_API_KEY not found in config.")
+    system_prompt_base = f"""You are an expert quantitative prediction-market AI system. 
+You strictly communicate by returning raw JSON arrays matching the requested schemas. No prose, no markdown formatting blocks.
+
+Valid Asset Universe:
+{universe_str}"""
+
+    # ========================================================
+    # PASS 1: BATCHED TRIAGE & ASSET MAPPING (5 per batch)
+    # ========================================================
+    print(f"PASS 1: Triaging {len(articles_lite)} highly-rated articles in batches of 5 to optimize KV caching...")
+    batched_articles = list(chunk_list(articles_lite, 5))
+    all_triaged_mappings = []
+
+    pass1_system_instruction = system_prompt_base + "\n\nTask: Filter incoming news batches for discrete, datable future outcomes that drive clear directional price movements for assets in the universe. Reject commentary or fully priced-in stories. For surviving stories, return their exact URL and an array of mapped assets from the universe with a 1-sentence directional thesis."
+
+    for index, batch in enumerate(batched_articles):
+        print(f" -> Processing Batch {index + 1}/{len(batched_articles)}...")
+        
+        user_prompt = f"Triage and map this batch of articles:\n{json.dumps(batch)}\n\nOutput strict JSON matching schema:\n[\n  {{\n    \"source_story_id\": \"<exact URL>\",\n    \"mapped_assets\": [\n      {{\n        \"ticker\": \"<EXACT TICKER>\",\n        \"directional_thesis\": \"<Bullish|Bearish|Volatile - explanation>\"\n      }}\n    ]\n  }}\n]"
+
+        try:
+            batch_res = call_gemini_api(pass1_system_instruction, user_prompt)
+            if isinstance(batch_res, list):
+                all_triaged_mappings.extend(batch_res)
+            elif isinstance(batch_res, dict):
+                if "mappings" in batch_res and isinstance(batch_res["mappings"], list):
+                    all_triaged_mappings.extend(batch_res["mappings"])
+                elif "triage" in batch_res and isinstance(batch_res["triage"], list):
+                    all_triaged_mappings.extend(batch_res["triage"])
+                else:
+                    for k, v in batch_res.items():
+                        if isinstance(v, dict):
+                            if "source_story_id" not in v:
+                                v["source_story_id"] = k
+                            all_triaged_mappings.append(v)
+                        elif isinstance(v, list):
+                            all_triaged_mappings.append({
+                                "source_story_id": k,
+                                "mapped_assets": v
+                            })
+        except Exception as e:
+            print(f"     [!] Failed processing batch {index + 1}: {e}")
+
+    if not all_triaged_mappings:
+        print("No valid asset mappings survived triage across all batches. Exiting.")
         return
 
-    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={config.GEMINI_API_KEY}"
+    valid_mappings = [m for m in all_triaged_mappings if m.get("mapped_assets")]
+    print(f"Triage complete. {len(valid_mappings)} stories successfully mapped to assets.")
 
-    # ==========================================
-    # PASS 1: TRIAGE & ASSET MAPPING WITH THESIS
-    # ==========================================
-    prompt1 = f"""You are a quantitative prediction-market analyst.
-Task: Triage news and map valid stories to specific financial assets from the universe, explicitly stating the directional thesis.
-
-PIPELINE:
-1. TRIAGE — Ask: is there a discrete, datable future outcome that a tradable asset will react to? Skip stories that are already resolved, fully priced-in, or pure commentary.
-2. ASSET MAPPING & THESIS — Map each surviving story to the smallest set of assets with a DEFENSIBLE causal chain. 
-   - You MUST explicitly state the directional thesis (e.g., "Bullish - supply shock drives prices up", "Bearish - missing earnings hurts stock").
-   - ONLY use tickers EXACTLY as written in the Asset Universe.
-
-Asset Universe:
-{universe_str}
-
-Articles to process:
-{json.dumps(articles_lite)}
-
-OUTPUT — return ONLY a JSON array, no prose:
-[
-  {{
-    "source_story_id": "<exact URL of the source article>",
-    "mapped_assets": [
-      {{
-        "ticker": "<EXACT TICKER from universe>",
-        "directional_thesis": "<e.g., Bullish / Bearish / Volatile - 1 sentence explaining why>"
-      }}
-    ]
-  }}
-]"""
-
-    print(f"PASS 1: Sending {len(top_articles)} articles to Gemini for Triage and Directional Mapping...")
-    try:
-        resp1 = requests.post(gemini_url, json={
-            "contents": [{"parts": [{"text": prompt1}]}],
-            "generationConfig": {"responseMimeType": "application/json"}
-        }, timeout=120)
-        resp1.raise_for_status()
-        pass1_json = json.loads(resp1.json()["candidates"][0]["content"]["parts"][0]["text"])
-    except Exception as e:
-        print(f"Error during Pass 1 LLM generation: {e}")
-        return
-
-    # Extract unique assets based on the new schema
     unique_assets = set()
-    for item in pass1_json:
-        for asset_obj in item.get("mapped_assets", []):
-            ticker = asset_obj.get("ticker")
-            if ticker:
-                unique_assets.add(ticker)
+    for item in valid_mappings:
+        for asset_obj in item["mapped_assets"]:
+            if asset_obj.get("ticker"):
+                unique_assets.add(asset_obj["ticker"])
 
-    if not unique_assets:
-        print("No valid asset mappings found in Pass 1. Exiting.")
-        return
-
-    # ==========================================
-    # PYTHON STEP: TAVILY PRICE DISCOVERY
-    # ==========================================
-    print(f"PYTHON STEP: Fetching current prices for {len(unique_assets)} mapped assets via Tavily...")
+    # ========================================================
+    # PYTHON INTERMEDIARY: TOKEN-RESTRICTED PRICE DISCOVERY
+    # ========================================================
+    print(f"PYTHON STEP: Executing price discovery for {len(unique_assets)} unique tickers via Tavily...")
     price_context = {}
-    if not config.TAVILY_API_KEY:
-        print("Warning: TAVILY_API_KEY not found. Proceeding without price context.")
-    else:
+    if config.TAVILY_API_KEY:
         for asset in unique_assets:
             payload = {
                 "api_key": config.TAVILY_API_KEY,
-                "query": f"current live market trading price of {asset} stock crypto commodity forex today",
+                "query": f"current market trading price of {asset} asset today close",
                 "search_depth": "basic",
-                "max_results": 2
+                "max_results": 1
             }
             try:
                 tav_resp = requests.post("https://api.tavily.com/search", json=payload, timeout=15)
                 if tav_resp.status_code == 200:
                     results = tav_resp.json().get("results", [])
-                    price_context[asset] = " | ".join([r.get("content", "") for r in results])
+                    if results:
+                        raw_snippet = results[0].get("content", "")
+                        price_context[asset] = raw_snippet[:150]
             except Exception as e:
-                print(f"Failed to fetch price for {asset}: {e}")
+                print(f"     [!] Price look-up skipped for {asset}: {e}")
 
-    # ==========================================
-    # PASS 2: NARRATIVE EVENT GENERATION
-    # ==========================================
-    prompt2 = f"""You are a quantitative prediction-market event generator. Quality over quantity.
-We have triaged the news, mapped the assets with a directional thesis, and fetched live prices to understand the current market state.
+    article_lookup = {a["url"]: a for a in articles_lite}
 
-Current Price Context:
-{json.dumps(price_context, indent=2)}
+    # ========================================================
+    # PASS 2: CONTEXT-ISOLATED NARRATIVE EVENT GENERATION
+    # ========================================================
+    print("PASS 2: Generating catalyst-driven narrative events via isolated single-story chat targets...")
+    final_events = []
 
-Triaged Stories, Mapped Assets, and Directional Thesis:
-{json.dumps(pass1_json, indent=2)}
+    pass2_system_instruction = system_prompt_base + """\n\nTask: Build a catalyst-driven prediction market event for an isolated target story.
+- TITLE RULES: BANNED from using absolute price targets or percentages. BANNED from using "Will X cross Y by Z". MUST use natural, organic phrasing naming the explicit news trigger and directional trend.
+- DESCRIPTION RULES: Minimum 5 sentences. Extract deep facts, specific metrics, or names from the snippet. Explain the complete operational linkage mechanism. Final sentence must define clean resolution terms relative to today's price context.
+- CAUSAL CHAIN RULE: Provide a compact "News Event -> Market Mechanism -> Asset Direction" flow string."""
 
-Original Articles (For deep context extraction):
-{json.dumps(articles_lite)}
+    for item in valid_mappings:
+        url = item.get("source_story_id")
+        orig_article = article_lookup.get(url)
+        if not orig_article:
+            continue
 
-    TITLE RULES (STRICT):
-    - BANNED: Do NOT formulate titles as questions (do NOT start with "Will", "Whether", "How", or similar, and do NOT use a question mark "?").
-    - BANNED: Do NOT include raw ticker symbols or asset codes (e.g., "US500", "AAPL.NAS", "WTI.NYSE", "BP.LSE", "NVDA.NAS") in the title.
-    - BANNED: Do NOT use price targets, dollar amounts, or percentages in the title.
-    - REQUIRED: Write the title as a confident, declarative statement or proposition of the expected outcome.
-    - REQUIRED: Use clean, natural, human-friendly terms for the asset in the title (e.g., "the US stock market", "Apple's stock price", "crude oil prices", "BP's share price").
-    - REQUIRED: The title MUST explicitly describe the news linkage and the directional reaction.
-    - Format Example: "Crude oil prices to trade higher this week following reported US strikes in Iran"
-    - Format Example: "Apple's stock price to drop on the news of the DOJ expanding its antitrust lawsuit"
-    - Format Example: "US stock market to decline following Federal Reserve officials' remarks on inflation"
-
-    CAUSAL CHAIN RULE:
-    - You must output a "causal_chain" field mapping the exact mechanism: "News Event -> Market Mechanism -> Asset Direction". Use human-friendly terms for the asset.
-    - Example: "USA hits Iran -> Strait of Hormuz supply risk -> Global oil supply shock -> Crude oil prices go up."
-
-DESCRIPTION RULES:
-- Minimum 5 sentences. Pull specific names, stats, geopolitical details, or quotes directly from the provided article snippets. Do not write fluffy, generic summaries. Provide real context.
-- The final sentence must state the resolution criteria relative to current price (e.g., "Resolves to Yes if WTI.NYSE closes the week higher than its current trading price.")
-
-TRADABILITY SCORE — float in [0.0, 1.0]:
-- 0.85–1.00: Clean catalyst, unambiguous resolution, explicit linkage.
-- 0.60–0.84: Clear resolution, moderate ambiguity.
-- Below 0.60: DO NOT EMIT. Skip the event.
-
-OUTPUT — return ONLY a JSON array, no prose:
-[
-  {{
-    "source_story_id": "<exact URL of the source article>",
-    "title": "<catalyst-driven directional question>",
-    "causal_chain": "<A -> B -> C mapping>",
-    "description": "<5-6 sentences: Deep news context extracted from article + exact resolution criteria>",
-    "linked_assets": ["<EXACT TICKER>"],
-    "directional_impact": "<Bullish|Bearish|Volatile>",
-    "category": "<industry category>",
-    "horizon": "<daily|weekly|monthly>",
-    "tradability_score": <float 0.60-1.0>
-  }}
-]"""
-
-    print("PASS 2: Generating narrative, directional prediction events...")
-    try:
-        resp2 = requests.post(gemini_url, json={
-            "contents": [{"parts": [{"text": prompt2}]}],
-            "generationConfig": {"responseMimeType": "application/json"}
-        }, timeout=120)
-        resp2.raise_for_status()
-        events = json.loads(resp2.json()["candidates"][0]["content"]["parts"][0]["text"])
-
-        # Post-LLM Deduplication: group by (Asset, Horizon) and keep the highest score
-        deduped_map = {}
-        for event in events:
-            assets = event.get("linked_assets", [])
-            if not assets or event.get("tradability_score", 0) < 0.60:
+        for asset_obj in item.get("mapped_assets", []):
+            ticker = asset_obj.get("ticker")
+            thesis = asset_obj.get("directional_thesis")
+            if not ticker:
                 continue
+
+            asset_price_info = price_context.get(ticker, "No real-time context available.")
             
-            key = f"{assets[0]}_{event.get('horizon', 'daily')}"
-            
-            if key not in deduped_map:
-                deduped_map[key] = event
-            else:
-                if event.get("tradability_score", 0) > deduped_map[key].get("tradability_score", 0):
-                    deduped_map[key] = event
+            isolated_user_prompt = f"""Generate exactly ONE prediction market event for this single mapped configuration:
 
-        unique_events = sorted(list(deduped_map.values()), key=lambda x: x.get("tradability_score", 0), reverse=True)
-        final_events = unique_events[:max_events]
+Target Article Details:
+- Title: {orig_article['title']}
+- Snippet: {orig_article['snippet']}
+- Source: {orig_article['source']}
+- URL: {url}
 
-        output_data = {
-            "metadata": {
-                "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
-                "events_generated": len(final_events)
-            },
-            "events": final_events
-        }
+Target Asset Mapping:
+- Ticker: {ticker}
+- Preliminary Directional Thesis: {thesis}
+- Current Web Price Context: {asset_price_info}
 
-        with open("prediction_events.json", "w", encoding="utf-8") as f:
-            json.dump(output_data, f, indent=2)
+Output strict JSON matching schema:
+{{
+  "source_story_id": "{url}",
+  "title": "<organic catalyst directional question>",
+  "causal_chain": "<A -> B -> C mechanism flow string>",
+  "description": "<5+ sentences rich context, clear linkage, and concrete resolution terms>",
+  "linked_assets": ["{ticker}"],
+  "directional_impact": "{asset_obj.get('directional_impact', 'Bullish')}",
+  "category": "Macroeconomics",
+  "horizon": "weekly",
+  "tradability_score": 0.90
+}}"""
 
-        print(f"Pipeline complete: Saved {len(final_events)} linkage-driven events to prediction_events.json")
+            try:
+                event_obj = call_gemini_api(pass2_system_instruction, isolated_user_prompt)
+                if isinstance(event_obj, dict):
+                    if event_obj.get("tradability_score", 0) >= 0.60:
+                        final_events.append(event_obj)
+            except Exception as e:
+                print(f"     [!] Failed to generate isolated event for {ticker}: {e}")
 
-    except Exception as e:
-        print(f"Error during Pass 2 LLM generation: {e}")
+    # ========================================================
+    # POST-LLM DEDUPLICATION & METADATA SAVE
+    # ========================================================
+    deduped_map = {}
+    for event in final_events:
+        assets = event.get("linked_assets", [])
+        if not assets:
+            continue
+        key = f"{assets[0]}_{event.get('horizon', 'weekly')}"
+        if key not in deduped_map or event.get("tradability_score", 0) > deduped_map[key].get("tradability_score", 0):
+            deduped_map[key] = event
+
+    unique_events = sorted(list(deduped_map.values()), key=lambda x: x.get("tradability_score", 0), reverse=True)
+    sliced_events = unique_events[:max_events]
+
+    output_data = {
+        "metadata": {
+            "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+            "events_generated": len(sliced_events),
+            "engine": "Gemini API (gemini-3.1-flash-lite)"
+        },
+        "events": sliced_events
+    }
+
+    with open("prediction_events.json", "w", encoding="utf-8") as f:
+        json.dump(output_data, f, indent=2)
+
+    print(f"Pipeline completely successful! Caching optimizations saved {len(sliced_events)} grounded events.")
 
 if __name__ == "__main__":
     generate_events()

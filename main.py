@@ -90,11 +90,11 @@ def run_aggregation(args):
     print(f"Deduplicated to {len(unique_articles)} unique articles.", file=sys.stderr)
 
     # Rank and categorize articles
-    use_gemini = config.GEMINI_API_KEY and not args.no_gemini
+    use_llm = bool(config.GEMINI_API_KEY) and not args.no_gemini
     
-    if use_gemini:
-        print("Using Gemini LLM for prediction market relevance and categorization...", file=sys.stderr)
-        final_articles = ranker.evaluate_with_gemini(unique_articles, config.GEMINI_API_KEY)
+    if use_llm:
+        print("Using Gemini API for prediction market relevance and categorization...", file=sys.stderr)
+        final_articles = ranker.evaluate_with_gemini(unique_articles)
     else:
         print("Using rule-based algorithm for ranking and categorization...", file=sys.stderr)
         final_articles = ranker.calculate_rule_based_scores(unique_articles)
@@ -121,7 +121,7 @@ def run_aggregation(args):
             "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
             "total_raw_scraped": len(aggregated_articles),
             "total_unique": len(unique_articles),
-            "ranking_method": "gemini-llm" if use_gemini else "rule-based"
+            "ranking_method": "gemini-llm" if use_llm else "rule-based"
         },
         "categories": grouped_articles
     }
