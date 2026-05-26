@@ -7,11 +7,57 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 import config
 
+import time
 _env_path = Path(__file__).resolve().parent / '.env'
 load_dotenv(dotenv_path=_env_path, override=True)
 
-CASCADE_API_URL = os.getenv("CASCADE_API_URL", "http://localhost:8800/api/admin/markets/from-prompt").strip()
+QUANTUM_API_URL = os.getenv("QUANTUM_API_URL", "http://localhost:3002/runs").rstrip("/")
+MARKETS_API_URL = os.getenv("MARKETS_API_URL", "http://localhost:8800/api/admin/markets").rstrip("/")
 ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "").strip()
+
+def _headers() -> dict:
+    h = {"Content-Type": "application/json"}
+    if ADMIN_API_TOKEN:
+        h["Authorization"] = f"Bearer {ADMIN_API_TOKEN}"
+    return h
+
+def _start_run(title: str, description: str, basket_size: int = 4, depth: str = "low") -> str:
+    payload = {
+        "basketSize": basket_size,
+        "depth": depth,
+        "description": description,
+        "title": title,
+    }
+    resp = requests.post(f"{QUANTUM_API_URL}/start", json=payload, headers=_headers(), timeout=30)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"Failed to start run ({resp.status_code}): {resp.text}")
+    data = resp.json()
+    run_id = data.get("runId") or data.get("run_id")
+    if not run_id:
+        raise RuntimeError(f"No runId in response: {data}")
+    return run_id
+
+def _poll_done(run_id: str, max_attempts: int = 60, sleep_s: int = 5) -> None:
+    status_url = f"{QUANTUM_API_URL}/{run_id}/status"
+    for attempt in range(max_attempts):
+        resp = requests.get(status_url, headers=_headers(), timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            status = data.get("status")
+            if status in ("done", "completed"):
+                return
+            if status == "error":
+                raise RuntimeError(f"Run failed: {data.get('error')}")
+        time.sleep(sleep_s)
+    raise TimeoutError("Timeout waiting for run completion")
+
+def _get_allocations_payload(run_id: str, source: str = "quantum", broker_mode: str = "mock") -> dict:
+    url = f"{QUANTUM_API_URL}/{run_id}/allocations"
+    params = {"source": source, "brokerMode": broker_mode}
+    resp = requests.get(url, params=params, headers=_headers(), timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Failed to fetch allocations ({resp.status_code}): {resp.text}")
+    return resp.json()
 
 def chunk_list(lst, n):
     for i in range(0, len(lst), n):
@@ -405,35 +451,27 @@ Output strict JSON matching schema:
     print(f"Pipeline complete. {len(sliced_events)} grounded events saved.")
 
     # ========================================================
-    # PUSH: Send each worthy event to the Cascade API
+    # PUSH: Send each worthy event to the Cascade API via allocations pipeline
     # ========================================================
     if sliced_events:
         print(f"\nPUSHING {len(sliced_events)} events to Cascade API...")
-        push_headers = {"Content-Type": "application/json"}
-        if ADMIN_API_TOKEN:
-            push_headers["Authorization"] = f"Bearer {ADMIN_API_TOKEN}"
-
         pushed, failed = 0, 0
         for event in sliced_events:
             title = event.get("title", "")
             description = event.get("description", "")
             if not title:
                 continue
-            payload = {
-                "title": title,
-                "description": description,
-                "basketSize": 4,
-                "source": "quantum",
-                "depth": "low",
-                "brokerMode": "mock"
-            }
             try:
-                resp = requests.post(CASCADE_API_URL, json=payload, headers=push_headers, timeout=30)
-                if resp.status_code in [200, 201]:
-                    print(f"  [+] Pushed: {title[:90]}")
+                print(f" -> Starting run for event: {title[:90]}")
+                run_id = _start_run(title, description, basket_size=4, depth="low")
+                _poll_done(run_id)
+                market_payload = _get_allocations_payload(run_id, source="quantum", broker_mode="mock")
+                resp = requests.post(MARKETS_API_URL, json=market_payload, headers=_headers(), timeout=30)
+                if resp.status_code in (200, 201):
+                    print(f"  [+] Pushed successfully: {title[:90]}")
                     pushed += 1
                 else:
-                    print(f"  [x] Failed ({resp.status_code}): {title[:90]}")
+                    print(f"  [x] Failed to create market event ({resp.status_code}): {title[:90]}")
                     failed += 1
             except Exception as e:
                 print(f"  [!] Error pushing '{title[:80]}': {e}")
