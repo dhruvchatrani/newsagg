@@ -75,9 +75,20 @@ def _poll_done(run_id: str, max_attempts: int = 60, sleep_s: int = 5) -> None:
 def _get_allocations_payload(run_id: str, source: str) -> dict:
     url = f"{QUANTUM_API_URL}/{run_id}/allocations"
     resp = requests.get(url, params={"source": source}, headers=_headers(), timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Failed to fetch allocations ({resp.status_code}): {resp.text}")
-    return resp.json()
+    if resp.status_code == 200:
+        return resp.json()
+
+    # Some runs can finish with an empty quantum basket while classical has a valid basket.
+    if source == "quantum" and resp.status_code == 400 and "empty quantum basket" in resp.text.lower():
+        print("Quantum basket is empty; retrying allocations with source=classical")
+        fallback_resp = requests.get(url, params={"source": "classical"}, headers=_headers(), timeout=30)
+        if fallback_resp.status_code == 200:
+            return fallback_resp.json()
+        raise RuntimeError(
+            f"Failed to fetch fallback classical allocations ({fallback_resp.status_code}): {fallback_resp.text}"
+        )
+
+    raise RuntimeError(f"Failed to fetch allocations ({resp.status_code}): {resp.text}")
 
 
 def _build_market_payload(run_id: str, title: str, description: str, allocations_payload: dict, broker_mode: str) -> dict:
