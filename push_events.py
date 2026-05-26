@@ -72,44 +72,13 @@ def _poll_done(run_id: str, max_attempts: int = 60, sleep_s: int = 5) -> None:
     raise TimeoutError("Timeout waiting for run completion")
 
 
-def _get_allocations_payload(run_id: str, source: str) -> dict:
+def _get_allocations_payload(run_id: str, source: str, broker_mode: str) -> dict:
     url = f"{QUANTUM_API_URL}/{run_id}/allocations"
-    resp = requests.get(url, params={"source": source}, headers=_headers(), timeout=30)
+    params = {"source": source, "brokerMode": broker_mode}
+    resp = requests.get(url, params=params, headers=_headers(), timeout=30)
     if resp.status_code != 200:
         raise RuntimeError(f"Failed to fetch allocations ({resp.status_code}): {resp.text}")
     return resp.json()
-
-
-def _build_market_payload(run_id: str, title: str, description: str, allocations_payload: dict, broker_mode: str) -> dict:
-    mapped_outcomes = []
-    for outcome in allocations_payload.get("outcomes", []):
-        mapped_stocks = []
-        for stock in outcome.get("stocks", []):
-            mapped_stocks.append({
-                "symbol": stock.get("symbol", ""),
-                "name": stock.get("name") or stock.get("symbol", ""),
-                "exchange": stock.get("exchange") or "NASDAQ",
-                "allocationPct": stock.get("allocationPct", 0),
-            })
-        mapped_outcomes.append({
-            "outcomeId": outcome.get("outcomeId", ""),
-            "label": outcome.get("label", ""),
-            "stocks": mapped_stocks,
-        })
-
-    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    opens_at = now_iso
-    closes_at = (datetime.now(timezone.utc) + timedelta(days=14)).isoformat().replace("+00:00", "Z")
-
-    return {
-        "eventId": run_id,
-        "title": title,
-        "description": description,
-        "outcomes": mapped_outcomes,
-        "opensAt": opens_at,
-        "closesAt": closes_at,
-        "brokerMode": broker_mode,
-    }
 
 
 def push_events(
@@ -139,11 +108,9 @@ def push_events(
     _poll_done(run_id)
 
     print(f"\n[Step 3] Fetching allocations from Quantum API (source={source})")
-    alloc_payload = _get_allocations_payload(run_id, source=source)
+    market_payload = _get_allocations_payload(run_id, source=source, broker_mode=broker_mode)
 
-    print("\n[Step 4] Mapping allocations payload and POSTing to markets API")
-    market_payload = _build_market_payload(run_id, title, description, alloc_payload, broker_mode=broker_mode)
-
+    print("\n[Step 4] POSTing Market create body to Bitzaurus API")
     resp = requests.post(MARKETS_API_URL, json=market_payload, headers=_headers(), timeout=30)
     try:
         resp_content = json.dumps(resp.json(), indent=2)
