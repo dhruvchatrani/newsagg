@@ -86,15 +86,14 @@ def _build_market_payload(run_id: str, title: str, description: str, allocations
         mapped_stocks = []
         for stock in outcome.get("stocks", []):
             mapped_stocks.append({
-                "symbol": stock.get("symbol"),
-                "name": stock.get("name") or stock.get("symbol"),
+                "symbol": stock.get("symbol", ""),
+                "name": stock.get("name") or stock.get("symbol", ""),
                 "exchange": stock.get("exchange") or "NASDAQ",
-                "allocationPct": stock.get("allocationPct"),
+                "allocationPct": stock.get("allocationPct", 0),
             })
-
         mapped_outcomes.append({
-            "outcomeId": outcome.get("outcomeId") or "",
-            "label": outcome.get("label") or "",
+            "outcomeId": outcome.get("outcomeId", ""),
+            "label": outcome.get("label", ""),
             "stocks": mapped_stocks,
         })
 
@@ -158,9 +157,7 @@ def push_events(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Push a random prediction event through Quantum, then POST to markets using /allocations."
-    )
+    ap = argparse.ArgumentParser(description="Push a random prediction event through Quantum, then POST to markets using /allocations.")
     ap.add_argument("--file", default="prediction_events.json")
     ap.add_argument("--basket-size", type=int, default=4)
     ap.add_argument("--depth", default="tree")
