@@ -1,49 +1,27 @@
 import json
 import re
 import os
+import sys
 import requests
 import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+
+# Add project root to sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import config
 from logger_setup import get_logger
 
-logger = get_logger("newsagg.event_generator")
+logger = get_logger("newsagg.event_generator_local")
 
-_env_path = Path(__file__).resolve().parent / '.env'
+_env_path = Path(__file__).resolve().parent.parent / '.env'
 load_dotenv(dotenv_path=_env_path, override=True)
-
-CASCADE_API_URL = os.getenv("CASCADE_API_URL", "http://localhost:8800/api/admin/markets/from-prompt").strip()
-ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "").strip()
-QUANTUM_API_URL = os.getenv("QUANTUM_API_URL", "https://blackbox-quantum.bitzaurus.com").strip()
-BITZAURUS_API_URL = os.getenv("BITZAURUS_API_URL", "https://api.bitzaurus.com/api/admin/markets").strip()
 
 def chunk_list(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
-
-# def parse_ollama_json(resp):
-#     text = resp.get("response", "").strip()
-#     if not text:
-#         text = resp.get("thinking", "").strip()
-#     if not text and "message" in resp:
-#         msg = resp["message"]
-#         text = msg.get("content", "").strip()
-#         if not text:
-#             text = msg.get("thinking", "").strip()
-#     if not text:
-#         raise ValueError("Empty response/thinking from Ollama.")
-#     
-#     text = text.strip()
-#     array_match = re.search(r'\[.*\]', text, re.DOTALL)
-#     if array_match:
-#         text = array_match.group(0)
-#     else:
-#         object_match = re.search(r'\{.*\}', text, re.DOTALL)
-#         if object_match:
-#             text = object_match.group(0)
-#     return json.loads(text)
 
 def clean_and_parse_json(text: str):
     text = text.strip()
@@ -106,6 +84,13 @@ def call_gemini_api(system_instruction: str, user_prompt: str) -> dict:
         raise Exception(f"Gemini API error {response.status_code}: {response.text}")
 
 def generate_events(news_file="news_database.json", assets_file="assets.json", max_events=15, articles=None):
+    # Adjust relative paths if run from scripts folder
+    proj_root = Path(__file__).resolve().parent.parent
+    if not os.path.isabs(news_file):
+        news_file = str(proj_root / news_file)
+    if not os.path.isabs(assets_file):
+        assets_file = str(proj_root / assets_file)
+
     try:
         with open(assets_file, 'r') as f:
             universe = json.load(f)
@@ -124,19 +109,15 @@ def generate_events(news_file="news_database.json", assets_file="assets.json", m
             logger.error(f"Error loading news file {news_file}: {e}", exc_info=True)
             return False
 
-    # ---------------------------------------------------------
-    # OPTIMIZATION: Only process articles with a score >= 0.9
-    # ---------------------------------------------------------
     high_value_articles = [a for a in articles if a.get("score", 0) >= 0.9]
     high_value_articles = sorted(high_value_articles, key=lambda x: x.get("score", 0), reverse=True)
-    top_articles = high_value_articles[:50] # Hard cap just in case
+    top_articles = high_value_articles[:50]
 
     if not top_articles:
         logger.info("No articles with score >= 0.9 found. Exiting pipeline.")
         return False
 
     articles_lite = [{"url": a["url"], "title": a["title"], "snippet": a["snippet"], "source": a["source"]} for a in top_articles]
-
     universe_str = ", ".join(universe)
 
     from prompts.event_generator_base import BASE_PROMPT
@@ -144,10 +125,8 @@ def generate_events(news_file="news_database.json", assets_file="assets.json", m
 
     system_prompt_base = BASE_PROMPT.format(universe_str=universe_str)
 
-    # ========================================================
-    # PASS 1: BATCHED TRIAGE & ASSET MAPPING (5 per batch)
-    # ========================================================
-    logger.info(f"PASS 1: Triaging {len(articles_lite)} highly-rated articles in batches of 5 to optimize KV caching...")
+    # PASS 1: BATCHED TRIAGE & ASSET MAPPING
+    logger.info(f"PASS 1: Triaging {len(articles_lite)} highly-rated articles in batches of 5...")
     batched_articles = list(chunk_list(articles_lite, 5))
     all_triaged_mappings = []
 
@@ -183,7 +162,7 @@ def generate_events(news_file="news_database.json", assets_file="assets.json", m
 
     if not all_triaged_mappings:
         logger.warning("No valid asset mappings survived triage across all batches. Exiting.")
-        return
+        return False
 
     valid_mappings = [m for m in all_triaged_mappings if m.get("mapped_assets")]
     logger.info(f"Triage complete. {len(valid_mappings)} stories successfully mapped to assets.")
@@ -194,9 +173,7 @@ def generate_events(news_file="news_database.json", assets_file="assets.json", m
             if asset_obj.get("ticker"):
                 unique_assets.add(asset_obj["ticker"])
 
-    # ========================================================
-    # PYTHON INTERMEDIARY: TOKEN-RESTRICTED PRICE DISCOVERY
-    # ========================================================
+    # PRICE DISCOVERY
     logger.info(f"PYTHON STEP: Executing price discovery for {len(unique_assets)} unique tickers via Tavily...")
     price_context = {}
     if config.TAVILY_API_KEY:
@@ -220,14 +197,11 @@ def generate_events(news_file="news_database.json", assets_file="assets.json", m
 
     article_lookup = {a["url"]: a for a in articles_lite}
 
-    # ========================================================
-    # PASS 2: CONTEXT-ISOLATED NARRATIVE EVENT GENERATION
-    # ========================================================
+    # PASS 2: NARRATIVE EVENT GENERATION
     logger.info("PASS 2: Generating catalyst-driven narrative events via isolated single-story chat targets...")
     final_events = []
 
     from prompts.event_generator_pass2 import PASS2_INSTRUCTION
-
     pass2_system_instruction = system_prompt_base + PASS2_INSTRUCTION
 
     for item in valid_mappings:
@@ -260,10 +234,10 @@ Target Asset Mapping:
 Apply ALL title, description, and worthy rules from the system instruction before writing your response.
 If ANY quality gate fails, still return the full JSON but set worthy=false with your honest tradability_score.
 
-TITLE REMINDER — short uncertainty question, 30-55 chars.
-  VARY your openers across styles: Could/Might/May | Odds of/Chances of | Is X about to/Are we nearing | Betting on/Bullish on
-  Do NOT repeat the same opener twice. Full list of options in the system instruction.
-  NOT: declarative statements, price targets, tickers, filler words.
+TITLE REMINDER — short uncertainty question, 30-55 chars:
+  "Can [Subject] [action]?" or "Is [Subject] [state]?" or "Too early to [verb] [Subject]?"
+  Example: "Can Nvidia stay unstoppable?" or "Is a crypto breakout finally here?"
+  NOT: declarative statements, "Will" spam, price targets, tickers, filler words.
 
 Output strict JSON matching schema:
 {{
@@ -299,9 +273,7 @@ Output strict JSON matching schema:
             except Exception as e:
                 logger.error(f"     [!] Failed to generate isolated event for {ticker}: {e}", exc_info=True)
 
-    # ========================================================
-    # POST-LLM DEDUPLICATION & METADATA SAVE
-    # ========================================================
+    # DEDUPLICATION & SAVE
     deduped_map = {}
     for event in final_events:
         url = event.get("source_story_id")
@@ -318,7 +290,7 @@ Output strict JSON matching schema:
         key=lambda x: parse_tradability_score(x.get("tradability_score")),
         reverse=True,
     )
-    sliced_events = unique_events[:1]
+    sliced_events = unique_events[:max_events]
 
     output_data = {
         "metadata": {
@@ -329,167 +301,11 @@ Output strict JSON matching schema:
         "events": sliced_events
     }
 
-    with open("prediction_events.json", "w", encoding="utf-8") as f:
+    output_path = str(proj_root / "prediction_events.json")
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output_data, f, indent=2)
 
-    logger.info(f"Pipeline complete. {len(sliced_events)} grounded events saved.")
-
-    # ========================================================
-    # PUSH: Send each worthy event to the Cascade API via Run -> Poll -> Promote -> Post flow
-    # ========================================================
-    if sliced_events:
-        logger.info(f"PUSHING {len(sliced_events)} events to Bitzaurus (Runs & Markets)...")
-        push_headers = {"Content-Type": "application/json"}
-        if ADMIN_API_TOKEN:
-            push_headers["Authorization"] = f"Bearer {ADMIN_API_TOKEN}"
-
-        pushed, failed = 0, 0
-        for event in sliced_events:
-            title = event.get("title", "")
-            description = event.get("description", "")
-            if not title:
-                continue
-
-            logger.info(f"Processing event: '{title[:60]}'")
-            
-            # Step 1: Start Run
-            run_payload = {
-                "title": title,
-                "description": description,
-                "basketSize": 4,
-                "depth": "tree"
-            }
-            try:
-                logger.info(f" -> Starting run on {QUANTUM_API_URL}...")
-                logger.debug(f"Quantum run payload: {json.dumps(run_payload)}")
-                start_resp = requests.post(f"{QUANTUM_API_URL}/runs/start", json=run_payload, timeout=30)
-                start_resp.raise_for_status()
-                run_data = start_resp.json()
-                logger.debug(f"Quantum start response: {json.dumps(run_data)}")
-                run_id = run_data.get("runId")
-                if not run_id:
-                    logger.error("  [x] Failed: No runId returned in start response.")
-                    failed += 1
-                    continue
-            except Exception as e:
-                logger.error(f"  [!] Error starting run: {e}", exc_info=True)
-                failed += 1
-                continue
-
-            # Step 2: Poll Run Status
-            logger.info(f" -> Run started with ID: {run_id}. Polling status...")
-            status = "queued"
-            success_status = False
-            for _ in range(60): # 120 seconds max timeout
-                time.sleep(2)
-                try:
-                    status_resp = requests.get(f"{QUANTUM_API_URL}/runs/{run_id}/status", timeout=15)
-                    status_resp.raise_for_status()
-                    status_data = status_resp.json()
-                    status = status_data.get("status")
-                    logger.info(f"    - Current status: {status}")
-                    if status == "done":
-                        success_status = True
-                        break
-                    elif status == "error":
-                        logger.error(f"  [x] Run failed with error: {status_data.get('error')}")
-                        break
-                except Exception as e:
-                    logger.error(f"    [!] Error polling status: {e}", exc_info=True)
-            
-            if not success_status:
-                logger.error(f"  [x] Run did not complete successfully (final status: {status}). skipping promotion.")
-                failed += 1
-                continue
-
-            # Step 3: Fetch Run Details
-            logger.info(f" -> Fetching run {run_id}...")
-            try:
-                run_resp = requests.get(f"{QUANTUM_API_URL}/runs/{run_id}", timeout=30)
-                run_resp.raise_for_status()
-                run_detail = run_resp.json()
-                logger.debug(f"Quantum run details: {json.dumps(run_detail)}")
-            except Exception as e:
-                logger.error(f"  [!] Error fetching run details: {e}", exc_info=True)
-                failed += 1
-                continue
-
-            # Step 4: Map & POST to bitzaurus-server
-            now = datetime.now(timezone.utc)
-            default_close = now + timedelta(days=14)
-
-            # Extract candidates and calculate score-weighted allocations
-            raw_outcomes = run_detail.get("outcomes", [])
-            outcomes_for_bitzaurus = []
-            
-            for o in raw_outcomes:
-                candidates = o.get("candidates", [])
-                if not candidates:
-                    continue
-                # Build symbol->score map (admin style)
-                score_by_sym = {}
-                for c in candidates:
-                    try:
-                        score_by_sym[c["symbol"]] = float(c.get("score", 0.5))
-                    except (ValueError, TypeError, KeyError):
-                        score_by_sym[c.get("symbol", "")] = 0.5
-                
-                # Take basket selected symbols or fall back to top 4 by score
-                basket = (
-                    o.get("quantumBasket", {}).get("selected", []) or
-                    o.get("classicalBasket", {}).get("selected", [])
-                )
-                if basket:
-                    symbols = basket
-                else:
-                    sorted_candidates = sorted(candidates, key=lambda c: float(c.get("score", 0) or 0), reverse=True)
-                    symbols = [c["symbol"] for c in sorted_candidates[:4] if "symbol" in c]
-                
-                # Admin-style allocation: score^1.5, 2-decimal rounding, no min/max bounds
-                raw_weights = [max(0.0, score_by_sym.get(s, 0.5)) ** 1.5 for s in symbols]
-                total_w = sum(raw_weights) or 1.0
-                stocks = []
-                for i, symbol in enumerate(symbols):
-                    pct = round((raw_weights[i] / total_w) * 10000) / 100
-                    stocks.append({"symbol": symbol, "allocationPct": pct})
-                
-                # Pin residual to top-weighted stock
-                drift = round(100.0 - sum(s["allocationPct"] for s in stocks), 2)
-                if abs(drift) > 0.01:
-                    top_idx = max(range(len(stocks)), key=lambda i: stocks[i]["allocationPct"])
-                    stocks[top_idx]["allocationPct"] = round(stocks[top_idx]["allocationPct"] + drift, 2)
-                
-                outcomes_for_bitzaurus.append({
-                    "label": o.get("label", "Trade"),
-                    "stocks": stocks
-                })
-
-            bitzaurus_payload = {
-                "title": run_detail.get("event", {}).get("title") or title,
-                "description": run_detail.get("event", {}).get("description") or description,
-                "outcomes": outcomes_for_bitzaurus,
-                "opensAt": now.isoformat().replace("+00:00", "Z"),
-                "closesAt": default_close.isoformat().replace("+00:00", "Z"),
-                "brokerMode": "mock",
-                "aiRunId": run_id
-            }
-
-            try:
-                logger.info(f" -> Posting event to bitzaurus-server {BITZAURUS_API_URL}...")
-                logger.debug(f"Bitzaurus payload: {json.dumps(bitzaurus_payload)}")
-                resp = requests.post(BITZAURUS_API_URL, json=bitzaurus_payload, headers=push_headers, timeout=30)
-                if resp.status_code in [200, 201]:
-                    logger.info(f"  [+] Pushed and created market: {title[:90]}")
-                    pushed += 1
-                else:
-                    logger.error(f"  [x] Failed posting market ({resp.status_code}): {resp.text[:200]}")
-                    failed += 1
-            except Exception as e:
-                logger.error(f"  [!] Error creating market: {e}", exc_info=True)
-                failed += 1
-
-        logger.info(f"Push complete: {pushed} succeeded, {failed} failed.")
-
+    logger.info(f"Pipeline complete. {len(sliced_events)} grounded events saved locally to {output_path}.")
     return True
 
 if __name__ == "__main__":

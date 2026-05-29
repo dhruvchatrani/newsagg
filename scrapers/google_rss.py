@@ -19,10 +19,10 @@ class GoogleRSSScraper(BaseScraper):
             # Fetch general top stories
             rss_url = "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en"
 
-        articles = []
-        
+        self.logger.info(f"Scraping Google RSS. Query: '{self.query}', Limit: {self.limit}, URL: {rss_url}")
         # Try using feedparser first
         try:
+            self.logger.debug("Attempting to parse RSS using feedparser library.")
             import feedparser
             feed = feedparser.parse(rss_url)
             
@@ -51,9 +51,11 @@ class GoogleRSSScraper(BaseScraper):
                     snippet=entry.get('summary', '')
                 )
                 articles.append(normalized)
+            self.logger.info(f"Successfully scraped {len(articles)} articles using feedparser.")
             return articles
             
         except ImportError:
+            self.logger.info("feedparser not installed. Falling back to xml.etree.ElementTree and requests.")
             # Fallback to standard library xml.etree.ElementTree if feedparser is not installed
             try:
                 headers = {
@@ -92,8 +94,10 @@ class GoogleRSSScraper(BaseScraper):
                                 snippet=description
                             )
                             articles.append(normalized)
+                    else:
+                        self.logger.error(f"HTTP request failed with status: {response.status_code}")
             except Exception as e:
-                # Log error or print to stderr, return empty list
-                pass
+                self.logger.error(f"Failed to parse XML from Google RSS feed: {e}", exc_info=True)
                 
+        self.logger.info(f"Successfully scraped {len(articles)} articles from Google RSS.")
         return articles

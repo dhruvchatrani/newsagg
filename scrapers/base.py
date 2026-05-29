@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from typing import List, Dict, Any
 from datetime import datetime
 import re
+from logger_setup import get_logger
 
 class BaseScraper(ABC):
     """
@@ -13,6 +14,7 @@ class BaseScraper(ABC):
         self.query = query
         self.api_key = api_key
         self.limit = limit
+        self.logger = get_logger(f"newsagg.scrapers.{self.__class__.__name__}")
 
     @abstractmethod
     def scrape(self) -> List[Dict[str, Any]]:
@@ -88,7 +90,7 @@ class BaseScraper(ABC):
             dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
             return dt.isoformat()
         except Exception:
-            pass
+            self.logger.warning(f"Could not parse date string: '{date_str}'. Returning raw value.")
 
         # Return default if all else fails
         return date_str

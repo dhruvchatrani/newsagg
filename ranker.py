@@ -5,6 +5,9 @@ from typing import List, Dict, Any
 import requests
 
 import config
+from logger_setup import get_logger
+
+logger = get_logger("newsagg.ranker")
 
 class PredictionMarketRanker:
     """
@@ -47,11 +50,13 @@ class PredictionMarketRanker:
                     seen_titles.add(clean_title)
                 unique_articles.append(article)
             else:
+                logger.debug(f"Duplicate article detected: '{article.get('title')}' (URL matches: {clean_url in seen_urls}, Title matches: {clean_title in seen_titles})")
                 for existing in unique_articles:
                     existing_url = re.sub(r'^https?://(www\.)?', '', existing.get("url", "")).split('?')[0].rstrip('/')
                     existing_title = re.sub(r'[^a-z0-9]', '', existing.get("title", "").lower())
                     if (clean_url and existing_url == clean_url) or (clean_title and existing_title == clean_title):
                         if len(article.get("snippet", "")) > len(existing.get("snippet", "")):
+                            logger.debug(f"Replacing duplicate snippet for '{existing.get('title')}' with longer snippet.")
                             existing["snippet"] = article.get("snippet", "")
                             existing["published_at"] = article.get("published_at", "")
                         break
@@ -285,39 +290,10 @@ class PredictionMarketRanker:
                     f"-----------------\n"
                 )
 
-            prompt = f"""You are a senior prediction-market analyst triaging news for an event-creation pipeline.
-Your job: score each article on how useful it is for generating tradable binary prediction events on financial assets.
+            from prompts.ranker_gemini import PROMPT as RANKER_PROMPT
+            prompt = RANKER_PROMPT.format(articles_text=articles_text)
 
-Context: The target asset universe includes US/UK/EU Equities, Major FX pairs, Crypto, and major Commodities. Do not highly rank stories that cannot map to these.
-
-For each article, output:
-1. category — exactly one of: Politics, Economics & Macro, Crypto & Web3, Geopolitics, Tech & AI, Science & Health, Sports, Pop Culture & Entertainment, Other
-2. prediction_relevance — float in [0.0, 1.0].
-   - 0.85–1.00: Hard catalyst with clear asset path (e.g., Fed decision, M&A).
-   - 0.60–0.84: Strong macro/geopolitical impact with proxy assets.
-   - 0.35–0.59: Soft signal, indirect path.
-   - 0.10–0.34: Generic coverage, soft news.
-   - 0.00–0.09: Un-tradable lifestyle/entertainment.
-3. reason — one sentence stating the catalyst and likely asset path.
-
-OUTPUT RULES:
-- Return ONLY a valid JSON array. No markdown fences.
-- One object per input article.
-
-Articles to evaluate:
-{articles_text}
-
-Schema:
-[
-  {{
-    "index": <int>,
-    "category": "<one of the 9 categories>",
-    "prediction_relevance": <float 0.0-1.0>,
-    "reason": "<one sentence>"
-  }}
-]"""
-
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={config.GEMINI_API_KEY}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{config.GEMINI_MODEL}:generateContent?key={config.GEMINI_API_KEY}"
             headers = {"Content-Type": "application/json"}
             payload = {
                 "contents": [
@@ -333,10 +309,12 @@ Schema:
             }
 
             try:
+                logger.debug(f"Sending batch to Gemini for evaluation. Batch size: {len(batch)}")
                 response = requests.post(url, json=payload, headers=headers, timeout=60)
                 if response.status_code == 200:
                     resp_json = response.json()
                     text = resp_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    logger.debug(f"Gemini evaluation response text: {text}")
                     
                     # Robust cleaning and parsing
                     if text.startswith("```"):
@@ -380,11 +358,13 @@ Schema:
                         })
                         scored_articles.append(scored_art)
                 else:
-                    print(f"Gemini API returned error status {response.status_code}: {response.text}")
+                    logger.error(f"Gemini API returned error status {response.status_code}: {response.text}")
+                    logger.info("Falling back to rule-based evaluation for current batch.")
                     fallback = self.calculate_rule_based_scores([i["article"] for i in batch])
                     scored_articles.extend(fallback)
             except Exception as e:
-                print(f"Gemini request failed: {e}")
+                logger.error(f"Gemini request failed: {e}", exc_info=True)
+                logger.info("Falling back to rule-based evaluation for current batch.")
                 fallback = self.calculate_rule_based_scores([i["article"] for i in batch])
                 scored_articles.extend(fallback)
 

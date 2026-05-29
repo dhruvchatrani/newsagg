@@ -10,6 +10,7 @@ NEWS_API_KEY = os.getenv("NEWS_API_KEY", "").strip()
 WORLD_NEWS_API_KEY = os.getenv("WORLD_NEWS_API_KEY", os.getenv("WORLD_NEWS_API", "")).strip()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip()
 
 # Ollama Config
 # OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://192.168.1.84:11434").strip()

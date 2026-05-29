@@ -8,11 +8,14 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any
 
 import config
+from logger_setup import get_logger
 from scrapers.google_rss import GoogleRSSScraper
 from scrapers.news_api import NewsAPIScraper
 from scrapers.world_news import WorldNewsScraper
 from scrapers.tavily import TavilyScraper
 from ranker import PredictionMarketRanker
+
+logger = get_logger("newsagg.main")
 
 def run_scraper(scraper_name: str, scraper_instance) -> List[Dict[str, Any]]:
     """Runs a single scraper instance and returns the normalized articles."""
@@ -20,8 +23,7 @@ def run_scraper(scraper_name: str, scraper_instance) -> List[Dict[str, Any]]:
         articles = scraper_instance.scrape()
         return articles
     except Exception as e:
-        # Silently fail or log to standard error to avoid messing with JSON output
-        print(f"Error running scraper {scraper_name}: {e}", file=sys.stderr)
+        logger.error(f"Error running scraper {scraper_name}: {e}", exc_info=True)
         return []
 
 def run_aggregation(args):
@@ -43,7 +45,7 @@ def run_aggregation(args):
             if src_clean in all_scrapers:
                 selected_sources.append(src_clean)
             else:
-                print(f"Warning: Unknown source '{src_clean}' skipped.", file=sys.stderr)
+                logger.warning(f"Unknown source '{src_clean}' skipped.")
     else:
         # Run all by default, but warn about missing API keys
         selected_sources = list(all_scrapers.keys())
@@ -56,8 +58,8 @@ def run_aggregation(args):
             missing_keys.append("Tavily API (TAVILY_API_KEY)")
         
         if missing_keys:
-            print(f"Notice: Missing API keys for: {', '.join(missing_keys)}. "
-                  f"These sources will be skipped, but available sources will run.", file=sys.stderr)
+            logger.warning(f"Notice: Missing API keys for: {', '.join(missing_keys)}. "
+                           f"These sources will be skipped, but available sources will run.")
 
     # Run selected scrapers concurrently
     aggregated_articles = []
@@ -81,22 +83,22 @@ def run_aggregation(args):
         for future in as_completed(futures):
             src_name = futures[future]
             articles = future.result()
-            print(f"Scraped {len(articles)} articles from {src_name}", file=sys.stderr)
+            logger.info(f"Scraped {len(articles)} articles from {src_name}")
             aggregated_articles.extend(articles)
 
     # Deduplicate articles
     ranker = PredictionMarketRanker(query)
     unique_articles = ranker.deduplicate(aggregated_articles)
-    print(f"Deduplicated to {len(unique_articles)} unique articles.", file=sys.stderr)
+    logger.info(f"Deduplicated to {len(unique_articles)} unique articles.")
 
     # Rank and categorize articles
     use_llm = bool(config.GEMINI_API_KEY) and not args.no_gemini
     
     if use_llm:
-        print("Using Gemini API for prediction market relevance and categorization...", file=sys.stderr)
+        logger.info("Using Gemini API for prediction market relevance and categorization...")
         final_articles = ranker.evaluate_with_gemini(unique_articles)
     else:
-        print("Using rule-based algorithm for ranking and categorization...", file=sys.stderr)
+        logger.info("Using rule-based algorithm for ranking and categorization...")
         final_articles = ranker.calculate_rule_based_scores(unique_articles)
 
     # Group final results by category/industry
@@ -134,9 +136,9 @@ def run_aggregation(args):
         try:
             with open(output_file, "w", encoding="utf-8") as f:
                 f.write(json_output)
-            print(f"Successfully saved grouped results to {output_file}", file=sys.stderr)
+            logger.info(f"Successfully saved grouped results to {output_file}")
         except Exception as e:
-            print(f"Error writing output file: {e}", file=sys.stderr)
+            logger.error(f"Error writing output file: {e}", exc_info=True)
             # Fallback to printing to stdout
             print(json_output)
     else:
@@ -181,18 +183,18 @@ def main():
     args = parser.parse_args()
 
     if args.daemon:
-        print("Running in continuous daemon mode. Execution will run every 3 minutes. Press Ctrl+C to terminate.", file=sys.stderr)
+        logger.info("Running in continuous daemon mode. Execution will run every 3 minutes. Press Ctrl+C to terminate.")
         while True:
             start_time = time.time()
             try:
                 run_aggregation(args)
             except Exception as e:
-                print(f"Error during daemon execution: {e}", file=sys.stderr)
+                logger.error(f"Error during daemon execution: {e}", exc_info=True)
             
             # Sleep for remainder of the 3-minute interval (180 seconds)
             elapsed = time.time() - start_time
             sleep_duration = max(1.0, 180.0 - elapsed)
-            print(f"Iteration completed in {elapsed:.2f}s. Sleeping for {sleep_duration:.2f}s...", file=sys.stderr)
+            logger.info(f"Iteration completed in {elapsed:.2f}s. Sleeping for {sleep_duration:.2f}s...")
             time.sleep(sleep_duration)
     else:
         run_aggregation(args)

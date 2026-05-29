@@ -6,6 +6,9 @@ from datetime import datetime, timezone
 
 from main import run_aggregation
 from event_generator import generate_events
+from logger_setup import get_logger
+
+logger = get_logger("newsagg.orchestrator")
 
 QUEUE_FILE = "news_queue.json"
 
@@ -23,7 +26,7 @@ def load_queue():
             with open(QUEUE_FILE, "r") as f:
                 return json.load(f)
         except Exception as e:
-            print(f"Error loading queue file: {e}")
+            logger.error(f"Error loading queue file: {e}", exc_info=True)
             
     return {"processed_urls": [], "pending_articles": []}
 
@@ -31,12 +34,12 @@ def save_queue(queue):
     with open(QUEUE_FILE, "w") as f:
         json.dump(queue, f, indent=2)
 
-def run_orchestrator(sleep_interval=480):
-    print("Starting News-to-Event Orchestrator...", file=sys.stderr)
+def run_orchestrator(sleep_interval=30):
+    logger.info("Starting News-to-Event Orchestrator...")
     args = MockArgs()
     
     while True:
-        print(f"\n--- [{datetime.now(timezone.utc).isoformat()}] Waking up to fetch news ---", file=sys.stderr)
+        logger.info("Waking up to fetch news")
         queue = load_queue()
         
         try:
@@ -63,21 +66,19 @@ def run_orchestrator(sleep_interval=480):
                     queue["pending_articles"].append(article)
                     new_articles_count += 1
             
-            print(f"Added {new_articles_count} new unique articles to the queue.", file=sys.stderr)
+            logger.info(f"Added {new_articles_count} new unique articles to the queue.")
             save_queue(queue)
             
             # 3. Threshold Check
             pending_count = len(queue["pending_articles"])
-            print(f"Current pending queue size: {pending_count}", file=sys.stderr)
+            logger.info(f"Current pending queue size: {pending_count}")
             
             if pending_count >= 5:
-                print(f"Threshold met ({pending_count} >= 5). Triggering Event Generation Pipeline...", file=sys.stderr)
+                logger.info(f"Threshold met ({pending_count} >= 5). Triggering Event Generation Pipeline...")
                 
                 articles_to_process = queue["pending_articles"][:]
                 
                 # 4. Event Generation
-                # We need to call generate_events with these articles
-                # generate_events should now process and push them, returning success count
                 success = generate_events(articles=articles_to_process, max_events=15)
                 
                 if success:
@@ -87,17 +88,17 @@ def run_orchestrator(sleep_interval=480):
                     
                     queue["pending_articles"] = []
                     save_queue(queue)
-                    print("Event Generation successful. Queue cleared.", file=sys.stderr)
+                    logger.info("Event Generation successful. Queue cleared.")
                 else:
-                    print("Event generation failed or returned no events.", file=sys.stderr)
+                    logger.warning("Event generation failed or returned no events.")
                     
             else:
-                print(f"Threshold not met. Waiting for more news.", file=sys.stderr)
+                logger.info("Threshold not met. Waiting for more news.")
 
         except Exception as e:
-            print(f"Error in orchestrator loop: {e}", file=sys.stderr)
+            logger.error(f"Error in orchestrator loop: {e}", exc_info=True)
             
-        print(f"Sleeping for {sleep_interval} seconds...", file=sys.stderr)
+        logger.info(f"Sleeping for {sleep_interval} seconds...")
         time.sleep(sleep_interval)
 
 if __name__ == "__main__":
