@@ -14,6 +14,7 @@ from scrapers.news_api import NewsAPIScraper
 from scrapers.world_news import WorldNewsScraper
 from scrapers.tavily import TavilyScraper
 from ranker import PredictionMarketRanker
+from event_generator import is_news_aggregator_enabled
 
 logger = get_logger("newsagg.main")
 
@@ -186,6 +187,12 @@ def main():
         logger.info("Running in continuous daemon mode. Execution will run every 3 minutes. Press Ctrl+C to terminate.")
         while True:
             start_time = time.time()
+
+            if not is_news_aggregator_enabled():
+                logger.info("News aggregator is DISABLED via feature flag. Skipping this cycle.")
+                time.sleep(180.0)
+                continue
+
             try:
                 run_aggregation(args)
             except Exception as e:

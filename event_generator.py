@@ -15,17 +15,37 @@ import time
 _env_path = Path(__file__).resolve().parent / '.env'
 load_dotenv(dotenv_path=_env_path, override=True)
 
-QUANTUM_API_URL = os.getenv("QUANTUM_API_URL", "http://localhost:3002/runs").rstrip("/")
+QUANTUM_API_URL = os.getenv("QUANTUM_API_URL", "http://localhost:3002").rstrip("/")
 MARKETS_API_URL = os.getenv("MARKETS_API_URL", "http://localhost:8800/api/admin/markets").rstrip("/")
 ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "").strip()
-QUANTUM_API_URL = os.getenv("QUANTUM_API_URL", "https://blackbox-quantum.bitzaurus.com").strip()
-BITZAURUS_API_URL = os.getenv("BITZAURUS_API_URL", "https://api.bitzaurus.com/api/admin/markets").strip()
+BITZAURUS_API_URL = os.getenv("BITZAURUS_API_URL", "http://localhost:8800/api/admin/markets").strip()
 
 def _headers() -> dict:
     h = {"Content-Type": "application/json"}
     if ADMIN_API_TOKEN:
         h["Authorization"] = f"Bearer {ADMIN_API_TOKEN}"
     return h
+
+def is_news_aggregator_enabled() -> bool:
+    """Check the bitzaurus-server feature flag for the news aggregator.
+
+    The GET endpoint is public (no auth required) so the daemon doesn't
+    need a short-lived admin JWT.  Falls back to True (enabled) if the
+    server is unreachable — fail-open keeps the daemon running when the
+    API is temporarily down.
+    """
+    try:
+        resp = requests.get(f"{BITZAURUS_API_URL.rsplit('/admin/markets', 1)[0]}/admin/system-config/news-aggregator", timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            # Server wraps in { success, data: { enabled } }
+            inner = data.get("data", data)
+            return inner.get("enabled", True)
+        logger.warning(f"Feature flag check returned status {resp.status_code}, defaulting to enabled")
+        return True
+    except Exception as e:
+        logger.warning(f"Could not reach feature flag endpoint, defaulting to enabled: {e}")
+        return True
 
 def _start_run(title: str, description: str, basket_size: int = 4, depth: str = "low") -> str:
     payload = {
@@ -150,6 +170,58 @@ def call_gemini_api(system_instruction: str, user_prompt: str) -> dict:
     else:
         logger.error(f"Gemini API error status {response.status_code}: {response.text}")
         raise Exception(f"Gemini API error {response.status_code}: {response.text}")
+
+def weighted_allocate(symbols, scores):
+    MIN_WEIGHT_PCT = 2.5
+    MAX_WEIGHT_PCT = 40.0
+    SCORE_EXPONENT = 1.5
+    n = len(symbols)
+    if n == 0:
+        return []
+
+    if n * MAX_WEIGHT_PCT < 100.0 or n * MIN_WEIGHT_PCT > 100.0:
+        equal = 100.0 / n
+        rounded = [round(equal, 4)] * n
+        rounded[-1] = round(100.0 - sum(rounded[:-1]), 4)
+        return [{"symbol": s, "allocationPct": p} for s, p in zip(symbols, rounded)]
+
+    raw = [max(s, 0.0) ** SCORE_EXPONENT for s in scores]
+    total_raw = sum(raw) or 1.0
+    pcts = [r / total_raw * 100.0 for r in raw]
+
+    for _ in range(50):
+        for i in range(n):
+            if pcts[i] < MIN_WEIGHT_PCT - 1e-9:
+                pcts[i] = MIN_WEIGHT_PCT
+            if pcts[i] > MAX_WEIGHT_PCT + 1e-9:
+                pcts[i] = MAX_WEIGHT_PCT
+
+        diff = 100.0 - sum(pcts)
+        if abs(diff) < 1e-6:
+            break
+
+        if diff > 0:
+            eligible = [i for i in range(n) if pcts[i] < MAX_WEIGHT_PCT - 1e-9]
+            if not eligible:
+                break
+            headroom = sum(MAX_WEIGHT_PCT - pcts[i] for i in eligible) or 1.0
+            for i in eligible:
+                pcts[i] += diff * (MAX_WEIGHT_PCT - pcts[i]) / headroom
+        else:
+            eligible = [i for i in range(n) if pcts[i] > MIN_WEIGHT_PCT + 1e-9]
+            if not eligible:
+                break
+            excess = sum(pcts[i] - MIN_WEIGHT_PCT for i in eligible) or 1.0
+            for i in eligible:
+                pcts[i] += diff * (pcts[i] - MIN_WEIGHT_PCT) / excess
+
+    rounded = [round(p, 4) for p in pcts]
+    drift = round(100.0 - sum(rounded), 4)
+    if abs(drift) > 0:
+        idx = max(range(n), key=lambda i: rounded[i])
+        rounded[idx] = round(rounded[idx] + drift, 4)
+
+    return [{"symbol": sym, "allocationPct": pct} for sym, pct in zip(symbols, rounded)]
 
 def generate_events(news_file="news_database.json", assets_file="assets.json", max_events=15, articles=None):
     try:
@@ -491,19 +563,9 @@ Output strict JSON matching schema:
                     sorted_candidates = sorted(candidates, key=lambda c: float(c.get("score", 0) or 0), reverse=True)
                     symbols = [c["symbol"] for c in sorted_candidates[:4] if "symbol" in c]
                 
-                # Admin-style allocation: score^1.5, 2-decimal rounding, no min/max bounds
-                raw_weights = [max(0.0, score_by_sym.get(s, 0.5)) ** 1.5 for s in symbols]
-                total_w = sum(raw_weights) or 1.0
-                stocks = []
-                for i, symbol in enumerate(symbols):
-                    pct = round((raw_weights[i] / total_w) * 10000) / 100
-                    stocks.append({"symbol": symbol, "allocationPct": pct})
-                
-                # Pin residual to top-weighted stock
-                drift = round(100.0 - sum(s["allocationPct"] for s in stocks), 2)
-                if abs(drift) > 0.01:
-                    top_idx = max(range(len(stocks)), key=lambda i: stocks[i]["allocationPct"])
-                    stocks[top_idx]["allocationPct"] = round(stocks[top_idx]["allocationPct"] + drift, 2)
+                # Admin-style allocation with 2.5% min / 40% max bounds and score^1.5
+                scores = [max(0.0, score_by_sym.get(s, 0.5)) for s in symbols]
+                stocks = weighted_allocate(symbols, scores)
                 
                 outcomes_for_bitzaurus.append({
                     "label": o.get("label", "Trade"),

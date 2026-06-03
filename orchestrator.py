@@ -5,7 +5,7 @@ import sys
 from datetime import datetime, timezone
 
 from main import run_aggregation
-from event_generator import generate_events
+from event_generator import generate_events, is_news_aggregator_enabled
 from logger_setup import get_logger
 
 logger = get_logger("newsagg.orchestrator")
@@ -40,6 +40,13 @@ def run_orchestrator(sleep_interval=30):
     
     while True:
         logger.info("Waking up to fetch news")
+
+        if not is_news_aggregator_enabled():
+            logger.info("News aggregator is DISABLED via feature flag. Skipping this cycle.")
+            logger.info(f"Sleeping for {sleep_interval} seconds...")
+            time.sleep(sleep_interval)
+            continue
+
         queue = load_queue()
         
         try:
