@@ -145,3 +145,8 @@ news_database.json
 results.json
 prediction_events.json
 aggregator.log
+
+# Generated outputs
+batch_payloads.json
+news_queue.json
+temp_news_db.json
