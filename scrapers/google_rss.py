@@ -11,6 +11,7 @@ class GoogleRSSScraper(BaseScraper):
     Does not require an API key.
     """
     def scrape(self) -> List[Dict[str, Any]]:
+        articles = []
         if self.query:
             # URL-encode the query
             encoded_query = urllib.parse.quote(self.query)
