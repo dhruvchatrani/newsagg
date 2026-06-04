@@ -200,8 +200,7 @@ def push_events(file_path="prediction_events.json"):
             for alloc in allocations:
                 mapped_stocks.append({
                     "symbol": alloc["symbol"],
-                    "name": alloc["symbol"],  # Fallback same as symbol
-                    "exchange": "NASDAQ",     # Default exchange
+                    "name": alloc["symbol"],
                     "allocationPct": alloc["allocationPct"]
                 })
 
@@ -217,13 +216,15 @@ def push_events(file_path="prediction_events.json"):
         closes_at = (datetime.now(timezone.utc) + timedelta(days=14)).isoformat().replace("+00:00", "Z")
 
         market_payload = {
-            "eventId": run_id, # Safely use run_id as the seed eventId (will be mapped to Postgres UUID inside backend)
+            "eventId": run_id,
+            "headline": title,
             "title": title,
             "description": description,
+            "sourceLink": event.get("source_story_id", ""),
             "outcomes": mapped_outcomes,
             "opensAt": opens_at,
             "closesAt": closes_at,
-            "brokerMode": "mock"
+            "brokerMode": "vantage"
         }
 
         # POST directly to markets

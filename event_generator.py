@@ -104,7 +104,7 @@ def weighted_allocate(symbols, scores):
     return [{"symbol": sym, "allocationPct": pct} for sym, pct in zip(symbols, rounded)]
 
 
-def _build_market_payload(run_id: str, title: str, description: str) -> dict:
+def _build_market_payload(run_id: str, title: str, description: str, source_link: str = "") -> dict:
     run_url = f"{QUANTUM_API_URL}/{run_id}"
     resp = requests.get(run_url, headers=_headers(), timeout=10)
     if resp.status_code != 200:
@@ -127,7 +127,6 @@ def _build_market_payload(run_id: str, title: str, description: str) -> dict:
             mapped_stocks.append({
                 "symbol": alloc["symbol"],
                 "name": alloc["symbol"],
-                "exchange": "NASDAQ",
                 "allocationPct": alloc["allocationPct"]
             })
 
@@ -142,12 +141,14 @@ def _build_market_payload(run_id: str, title: str, description: str) -> dict:
 
     return {
         "eventId": run_id,
+        "headline": title,
         "title": title,
         "description": description,
+        "sourceLink": source_link,
         "outcomes": mapped_outcomes,
         "opensAt": now_iso,
         "closesAt": closes_at,
-        "brokerMode": "mock"
+        "brokerMode": "vantage"
     }
 
 def chunk_list(lst, n):
@@ -556,7 +557,7 @@ Output strict JSON matching schema:
                 print(f" -> Starting run for event: {title[:90]}")
                 run_id = _start_run(title, description, basket_size=4, depth="tree")
                 _poll_done(run_id)
-                market_payload = _build_market_payload(run_id, title, description)
+                market_payload = _build_market_payload(run_id, title, description, source_link=event.get("source_story_id", ""))
                 resp = requests.post(MARKETS_API_URL, json=market_payload, headers=_headers(), timeout=30)
                 if resp.status_code in (200, 201):
                     print(f"  [+] Pushed successfully: {title[:90]}")
