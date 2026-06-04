@@ -125,7 +125,7 @@ def run_quantum_streaming(title, description, basket_size=4, depth="tree", poll_
     payload = {"basketSize": basket_size, "depth": depth, "description": description, "title": title}
 
     # 1. Kick off the run (non-blocking)
-    start_resp = requests.post(f"{url_base}/start", json=payload, headers=_headers(), timeout=30)
+    start_resp = requests.post(f"{url_base}/start", json=payload, headers=_headers(), timeout=300)
     if start_resp.status_code not in (200, 201):
         raise RuntimeError(f"Quantum run start failed ({start_resp.status_code}): {start_resp.text}")
     run_id = start_resp.json()["runId"]
@@ -133,7 +133,7 @@ def run_quantum_streaming(title, description, basket_size=4, depth="tree", poll_
     # 2. Poll for progress events
     cursor = 0
     while True:
-        ev_resp = requests.get(f"{url_base}/{run_id}/events?since={cursor}", headers=_headers(), timeout=15)
+        ev_resp = requests.get(f"{url_base}/{run_id}/events?since={cursor}", headers=_headers(), timeout=150)
         if ev_resp.status_code != 200:
             time.sleep(poll_interval)
             continue
@@ -165,7 +165,7 @@ def run_quantum_streaming(title, description, basket_size=4, depth="tree", poll_
         time.sleep(poll_interval)
 
     # 3. Fetch the final cached result
-    run_resp = requests.get(f"{url_base}/{run_id}", headers=_headers(), timeout=15)
+    run_resp = requests.get(f"{url_base}/{run_id}", headers=_headers(), timeout=150)
     if run_resp.status_code != 200:
         raise RuntimeError(f"Failed to fetch Quantum run result ({run_resp.status_code}): {run_resp.text}")
     run_data = run_resp.json()
@@ -246,7 +246,7 @@ def call_gemini_api(system_instruction: str, user_prompt: str) -> dict:
             "responseMimeType": "application/json"
         }
     }
-    response = requests.post(url, json=payload, headers=headers, timeout=60)
+    response = requests.post(url, json=payload, headers=headers, timeout=600)
     if response.status_code == 200:
         resp_json = response.json()
         text = resp_json["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -386,7 +386,7 @@ For each surviving story, return its exact URL and the mapped assets with a 1-se
                 "max_results": 1
             }
             try:
-                tav_resp = requests.post("https://api.tavily.com/search", json=payload, timeout=15)
+                tav_resp = requests.post("https://api.tavily.com/search", json=payload, timeout=55)
                 if tav_resp.status_code == 200:
                     results = tav_resp.json().get("results", [])
                     if results:
@@ -569,7 +569,7 @@ Output strict JSON matching schema:
         key=lambda x: parse_tradability_score(x.get("tradability_score")),
         reverse=True,
     )
-    sliced_events = unique_events[:max_events]
+    sliced_events = unique_events[:1]
 
     output_data = {
         "metadata": {
@@ -606,7 +606,7 @@ Output strict JSON matching schema:
                     source_link=event.get("source_story_id", ""),
                     headline=event.get("headline", "")
                 )
-                resp = requests.post(MARKETS_API_URL, json=market_payload, headers=_headers(), timeout=30)
+                resp = requests.post(MARKETS_API_URL, json=market_payload, headers=_headers(), timeout=300)
                 if resp.status_code in (200, 201):
                     print(f"  [+] Pushed successfully: {title[:90]}")
                     pushed += 1
