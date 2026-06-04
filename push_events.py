@@ -2,22 +2,17 @@ import argparse
 import json
 import os
 import random
-import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
-# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=env_path, override=True)
 
-# Quantum service base URL (no trailing slash)
 QUANTUM_API_URL = os.getenv("QUANTUM_API_URL", "http://localhost:3002/runs").rstrip("/")
-# Bitzaurus admin markets endpoint
 MARKETS_API_URL = os.getenv("MARKETS_API_URL", "http://localhost:8800/api/admin/markets").rstrip("/")
-
 ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "").strip()
 
 
@@ -37,56 +32,61 @@ def _load_events(file_path: str) -> list:
     return events
 
 
-def _start_run(title: str, description: str, basket_size: int, depth: str) -> str:
-    payload = {
-        "basketSize": basket_size,
-        "depth": depth,
-        "description": description,
-        "title": title,
-    }
-    resp = requests.post(f"{QUANTUM_API_URL}/start", json=payload, headers=_headers(), timeout=30)
-    if resp.status_code not in (200, 201):
-        raise RuntimeError(f"Failed to start run ({resp.status_code}): {resp.text}")
-    data = resp.json()
-    run_id = data.get("runId") or data.get("run_id")
-    if not run_id:
-        raise RuntimeError(f"No runId in response: {data}")
-    return run_id
+def weighted_allocate(symbols, scores):
+    MIN_WEIGHT_PCT = 2.5
+    MAX_WEIGHT_PCT = 40.0
+    SCORE_EXPONENT = 1.5
+    n = len(symbols)
+    if n == 0:
+        return []
 
+    if n * MAX_WEIGHT_PCT < 100.0 or n * MIN_WEIGHT_PCT > 100.0:
+        equal = 100.0 / n
+        rounded = [round(equal, 4)] * n
+        rounded[-1] = round(100.0 - sum(rounded[:-1]), 4)
+        return [{"symbol": s, "allocationPct": p} for s, p in zip(symbols, rounded)]
 
-def _poll_done(run_id: str, max_attempts: int = 60, sleep_s: int = 5) -> None:
-    status_url = f"{QUANTUM_API_URL}/{run_id}/status"
-    for attempt in range(max_attempts):
-        resp = requests.get(status_url, headers=_headers(), timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            status = data.get("status")
-            print(f"Attempt {attempt + 1}/{max_attempts}: Status is '{status}'")
-            if status in ("done", "completed"):
-                return
-            if status == "error":
-                raise RuntimeError(f"Run failed: {data.get('error')}")
+    raw = [max(s, 0.0) ** SCORE_EXPONENT for s in scores]
+    total_raw = sum(raw) or 1.0
+    pcts = [r / total_raw * 100.0 for r in raw]
+
+    for _ in range(50):
+        for i in range(n):
+            if pcts[i] < MIN_WEIGHT_PCT - 1e-9:
+                pcts[i] = MIN_WEIGHT_PCT
+            if pcts[i] > MAX_WEIGHT_PCT + 1e-9:
+                pcts[i] = MAX_WEIGHT_PCT
+        diff = 100.0 - sum(pcts)
+        if abs(diff) < 1e-6:
+            break
+        if diff > 0:
+            eligible = [i for i in range(n) if pcts[i] < MAX_WEIGHT_PCT - 1e-9]
+            if not eligible:
+                break
+            headroom = sum(MAX_WEIGHT_PCT - pcts[i] for i in eligible) or 1.0
+            for i in eligible:
+                pcts[i] += diff * (MAX_WEIGHT_PCT - pcts[i]) / headroom
         else:
-            print(f"Status check failed ({resp.status_code})")
-        time.sleep(sleep_s)
-    raise TimeoutError("Timeout waiting for run completion")
+            eligible = [i for i in range(n) if pcts[i] > MIN_WEIGHT_PCT + 1e-9]
+            if not eligible:
+                break
+            excess = sum(pcts[i] - MIN_WEIGHT_PCT for i in eligible) or 1.0
+            for i in eligible:
+                pcts[i] += diff * (pcts[i] - MIN_WEIGHT_PCT) / excess
 
+    rounded = [round(p, 4) for p in pcts]
+    drift = round(100.0 - sum(rounded), 4)
+    if abs(drift) > 0:
+        idx = max(range(n), key=lambda i: rounded[i])
+        rounded[idx] = round(rounded[idx] + drift, 4)
 
-def _get_allocations_payload(run_id: str, source: str, broker_mode: str) -> dict:
-    url = f"{QUANTUM_API_URL}/{run_id}/allocations"
-    params = {"source": source, "brokerMode": broker_mode}
-    resp = requests.get(url, params=params, headers=_headers(), timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Failed to fetch allocations ({resp.status_code}): {resp.text}")
-    return resp.json()
+    return [{"symbol": sym, "allocationPct": pct} for sym, pct in zip(symbols, rounded)]
 
 
 def push_events(
     file_path: str = "prediction_events.json",
     basket_size: int = 4,
     depth: str = "tree",
-    source: str = "quantum",
-    broker_mode: str = "mock",
 ) -> None:
     events = _load_events(file_path)
     if not events:
@@ -100,17 +100,53 @@ def push_events(
         print("Selected event does not have a title.")
         return
 
-    print(f"\n[Step 1] Starting run for event: {title}")
-    run_id = _start_run(title, description, basket_size=basket_size, depth=depth)
-    print(f"Successfully started run. Run ID: {run_id}")
+    print(f"\n[Step 1] Running Quantum pipeline for event: {title}")
+    run_payload = {"basketSize": basket_size, "depth": depth, "description": description, "title": title}
+    resp = requests.post(QUANTUM_API_URL, json=run_payload, headers=_headers(), timeout=120)
+    if resp.status_code not in (200, 201):
+        print(f"Quantum run failed ({resp.status_code}): {resp.text}")
+        return
+    run_data = resp.json()
+    print(f"Pipeline complete. Run ID: {run_data.get('runId')}")
 
-    print("\n[Step 2] Polling for run completion...")
-    _poll_done(run_id)
+    print("\n[Step 2] Building market payload from run outcomes...")
+    mapped_outcomes = []
+    for outcome in run_data.get("outcomes", []):
+        basket_data = outcome.get("quantumBasket") or outcome.get("classicalBasket") or {}
+        selected_symbols = basket_data.get("selected", [])
+        if not selected_symbols:
+            continue
+        candidate_scores = {c["symbol"]: c["score"] for c in outcome.get("candidates", [])}
+        scores = [candidate_scores.get(sym, 0.5) for sym in selected_symbols]
+        allocations = weighted_allocate(selected_symbols, scores)
+        mapped_stocks = []
+        for alloc in allocations:
+            mapped_stocks.append({
+                "symbol": alloc["symbol"],
+                "name": alloc["symbol"],
+                "allocationPct": alloc["allocationPct"]
+            })
+        mapped_outcomes.append({
+            "outcomeId": outcome.get("outcomeId", ""),
+            "label": outcome.get("label", ""),
+            "stocks": mapped_stocks
+        })
 
-    print(f"\n[Step 3] Fetching allocations from Quantum API (source={source})")
-    market_payload = _get_allocations_payload(run_id, source=source, broker_mode=broker_mode)
+    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    closes_at = (datetime.now(timezone.utc) + timedelta(days=14)).isoformat().replace("+00:00", "Z")
+    market_payload = {
+        "eventId": run_data.get("runId", ""),
+        "headline": title,
+        "title": title,
+        "description": description,
+        "sourceLink": event.get("source_story_id", ""),
+        "outcomes": mapped_outcomes,
+        "opensAt": now_iso,
+        "closesAt": closes_at,
+        "brokerMode": "vantage"
+    }
 
-    print("\n[Step 4] POSTing Market create body to Bitzaurus API")
+    print("\n[Step 3] POSTing market payload to Cascade API")
     resp = requests.post(MARKETS_API_URL, json=market_payload, headers=_headers(), timeout=30)
     try:
         resp_content = json.dumps(resp.json(), indent=2)
@@ -124,20 +160,16 @@ def push_events(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Push a random prediction event through Quantum, then POST to markets using /allocations.")
+    ap = argparse.ArgumentParser(description="Push a random prediction event through sync Quantum pipeline, then POST to markets.")
     ap.add_argument("--file", default="prediction_events.json")
     ap.add_argument("--basket-size", type=int, default=4)
     ap.add_argument("--depth", default="tree")
-    ap.add_argument("--source", choices=["quantum", "classical"], default="quantum")
-    ap.add_argument("--broker-mode", default="mock")
     args = ap.parse_args()
 
     push_events(
         file_path=args.file,
         basket_size=args.basket_size,
         depth=args.depth,
-        source=args.source,
-        broker_mode=args.broker_mode,
     )
 
 

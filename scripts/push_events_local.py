@@ -2,7 +2,6 @@ import json
 import random
 import requests
 import os
-import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 # pyrefly: ignore [missing-import]
@@ -104,82 +103,23 @@ def push_events(file_path="prediction_events.json"):
         print("Selected event does not have a title.")
         return
 
-    payload = {
-        "basketSize": 4,
-        "depth": "tree",
-        "description": description,
-        "title": title
-    }
-
-    # ==========================================
-    # STEP 1: Start the run on Quantum service
-    # ==========================================
-    print(f"\n[Step 1] Starting run for event: {title}")
+    print(f"\n[Step 1] Running Quantum pipeline for event: {title}")
+    run_payload = {"basketSize": 4, "depth": "tree", "description": description, "title": title}
     try:
-        response = requests.post(f"{QUANTUM_API_URL}/runs/start", json=payload, headers=headers, timeout=30)
-        if response.status_code not in [200, 201]:
-            print(f"Failed to start run. Status: {response.status_code}, Response: {response.text}")
+        resp = requests.post(f"{QUANTUM_API_URL}/runs", json=run_payload, headers=headers, timeout=120)
+        if resp.status_code not in (200, 201):
+            print(f"Quantum run failed ({resp.status_code}): {resp.text}")
             return
-        
-        resp_json = response.json()
-        run_id = resp_json.get("runId", resp_json.get("run_id"))
-        if not run_id:
-            print(f"Could not find run_id in response: {resp_json}")
-            return
-        print(f"Successfully started run. Run ID: {run_id}")
+        run_data = resp.json()
+        print(f"Pipeline complete. Run ID: {run_data.get('runId')}")
     except Exception as e:
-        print(f"Error starting run: {e}")
+        print(f"Error running Quantum pipeline: {e}")
         return
 
     # ==========================================
-    # STEP 2: Poll for completion
+    # STEP 2: Calculate allocationPct locally
     # ==========================================
-    print("\n[Step 2] Polling for run completion...")
-    status_url = f"{QUANTUM_API_URL}/runs/{run_id}/status"
-    is_done = False
-    max_attempts = 60
-    for attempt in range(max_attempts):
-        try:
-            status_resp = requests.get(status_url, headers=headers, timeout=10)
-            if status_resp.status_code == 200:
-                status_data = status_resp.json()
-                status = status_data.get("status")
-                print(f"Attempt {attempt+1}/{max_attempts}: Status is '{status}'")
-                if status in ("done", "completed"):
-                    is_done = True
-                    break
-                elif status == "error":
-                    print(f"Run failed with error: {status_data.get('error')}")
-                    return
-            else:
-                print(f"Failed to check status. Code: {status_resp.status_code}")
-        except Exception as e:
-            print(f"Error checking status (retrying): {e}")
-        time.sleep(5)
-
-    if not is_done:
-        print("Timeout waiting for AI solvers to finish.")
-        return
-
-    # ==========================================
-    # STEP 3: Fetch finished run details (no promote call)
-    # ==========================================
-    print(f"\n[Step 3] Fetching completed run data for Run ID: {run_id}")
-    run_url = f"{QUANTUM_API_URL}/runs/{run_id}"
-    try:
-        run_resp = requests.get(run_url, headers=headers, timeout=10)
-        if run_resp.status_code != 200:
-            print(f"Failed to fetch run data. Status: {run_resp.status_code}")
-            return
-        run_data = run_resp.json()
-    except Exception as e:
-        print(f"Error fetching run details: {e}")
-        return
-
-    # ==========================================
-    # STEP 4: Calculate allocationPct locally
-    # ==========================================
-    print("\n[Step 4] Performing local allocation calculations...")
+    print("\n[Step 2] Performing local allocation calculations...")
     try:
         mapped_outcomes = []
         for outcome in run_data.get("outcomes", []):
@@ -189,11 +129,8 @@ def push_events(file_path="prediction_events.json"):
                 print(f"Outcome {outcome.get('outcomeId')} has an empty basket.")
                 continue
 
-            # Load LLM scores for selected symbols
             candidate_scores = {c["symbol"]: c["score"] for c in outcome.get("candidates", [])}
             scores = [candidate_scores.get(sym, 0.5) for sym in selected_symbols]
-
-            # Calculate allocation list
             allocations = weighted_allocate(selected_symbols, scores)
 
             mapped_stocks = []
@@ -210,13 +147,12 @@ def push_events(file_path="prediction_events.json"):
                 "stocks": mapped_stocks
             })
 
-        # Base dates
         now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         opens_at = now_iso
         closes_at = (datetime.now(timezone.utc) + timedelta(days=14)).isoformat().replace("+00:00", "Z")
 
         market_payload = {
-            "eventId": run_id,
+            "eventId": run_data.get("runId", ""),
             "headline": title,
             "title": title,
             "description": description,
@@ -227,10 +163,9 @@ def push_events(file_path="prediction_events.json"):
             "brokerMode": "vantage"
         }
 
-        # POST directly to markets
         print(f"Posting finalized payload to markets API: {MARKETS_API_URL}")
         market_resp = requests.post(MARKETS_API_URL, json=market_payload, headers=headers, timeout=30)
-        
+
         try:
             resp_content = json.dumps(market_resp.json(), indent=2)
         except ValueError:

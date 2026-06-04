@@ -7,7 +7,6 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import config
 
-import time
 _env_path = Path(__file__).resolve().parent / '.env'
 load_dotenv(dotenv_path=_env_path, override=True)
 
@@ -20,36 +19,6 @@ def _headers() -> dict:
     if ADMIN_API_TOKEN:
         h["Authorization"] = f"Bearer {ADMIN_API_TOKEN}"
     return h
-
-def _start_run(title: str, description: str, basket_size: int = 4, depth: str = "low") -> str:
-    payload = {
-        "basketSize": basket_size,
-        "depth": depth,
-        "description": description,
-        "title": title,
-    }
-    resp = requests.post(f"{QUANTUM_API_URL}/start", json=payload, headers=_headers(), timeout=30)
-    if resp.status_code not in (200, 201):
-        raise RuntimeError(f"Failed to start run ({resp.status_code}): {resp.text}")
-    data = resp.json()
-    run_id = data.get("runId") or data.get("run_id")
-    if not run_id:
-        raise RuntimeError(f"No runId in response: {data}")
-    return run_id
-
-def _poll_done(run_id: str, max_attempts: int = 60, sleep_s: int = 5) -> None:
-    status_url = f"{QUANTUM_API_URL}/{run_id}/status"
-    for attempt in range(max_attempts):
-        resp = requests.get(status_url, headers=_headers(), timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            status = data.get("status")
-            if status in ("done", "completed"):
-                return
-            if status == "error":
-                raise RuntimeError(f"Run failed: {data.get('error')}")
-        time.sleep(sleep_s)
-    raise TimeoutError("Timeout waiting for run completion")
 
 def weighted_allocate(symbols, scores):
     MIN_WEIGHT_PCT = 2.5
@@ -104,15 +73,9 @@ def weighted_allocate(symbols, scores):
     return [{"symbol": sym, "allocationPct": pct} for sym, pct in zip(symbols, rounded)]
 
 
-def _build_market_payload(run_id: str, title: str, description: str, source_link: str = "") -> dict:
-    run_url = f"{QUANTUM_API_URL}/{run_id}"
-    resp = requests.get(run_url, headers=_headers(), timeout=10)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Failed to fetch run data ({resp.status_code}): {resp.text}")
-    run_data = resp.json()
-
+def _market_payload_from_outcomes(run_id: str, outcomes: list, title: str, description: str, source_link: str = "") -> dict:
     mapped_outcomes = []
-    for outcome in run_data.get("outcomes", []):
+    for outcome in outcomes:
         basket_data = outcome.get("quantumBasket") or outcome.get("classicalBasket") or {}
         selected_symbols = basket_data.get("selected", [])
         if not selected_symbols:
@@ -554,10 +517,18 @@ Output strict JSON matching schema:
             if not title:
                 continue
             try:
-                print(f" -> Starting run for event: {title[:90]}")
-                run_id = _start_run(title, description, basket_size=4, depth="tree")
-                _poll_done(run_id)
-                market_payload = _build_market_payload(run_id, title, description, source_link=event.get("source_story_id", ""))
+                print(f" -> Running pipeline for event: {title[:90]}")
+                run_payload = {"basketSize": 4, "depth": "tree", "description": description, "title": title}
+                run_resp = requests.post(QUANTUM_API_URL, json=run_payload, headers=_headers(), timeout=120)
+                if run_resp.status_code not in (200, 201):
+                    raise RuntimeError(f"Quantum run failed ({run_resp.status_code}): {run_resp.text}")
+                run_data = run_resp.json()
+                market_payload = _market_payload_from_outcomes(
+                    run_data.get("runId", ""),
+                    run_data.get("outcomes", []),
+                    title, description,
+                    source_link=event.get("source_story_id", "")
+                )
                 resp = requests.post(MARKETS_API_URL, json=market_payload, headers=_headers(), timeout=30)
                 if resp.status_code in (200, 201):
                     print(f"  [+] Pushed successfully: {title[:90]}")
