@@ -148,7 +148,7 @@ def _build_market_payload(run_id: str, title: str, description: str, source_link
         "outcomes": mapped_outcomes,
         "opensAt": now_iso,
         "closesAt": closes_at,
-        "brokerMode": "vantage"
+        "brokerMode": "mock"
     }
 
 def chunk_list(lst, n):
