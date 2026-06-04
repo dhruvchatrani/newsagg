@@ -1,6 +1,7 @@
 import json
 import re
 import os
+import time
 import requests
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -10,8 +11,7 @@ import config
 _env_path = Path(__file__).resolve().parent / '.env'
 load_dotenv(dotenv_path=_env_path, override=True)
 
-_quantum_base = os.getenv("QUANTUM_API_URL", "http://localhost:3002").rstrip("/").removesuffix("/runs")
-QUANTUM_API_URL = _quantum_base + "/runs"
+QUANTUM_BASE_URL = os.getenv("QUANTUM_API_URL", "http://localhost:3002").rstrip("/").removesuffix("/runs")
 MARKETS_API_URL = os.getenv("MARKETS_API_URL", "http://localhost:8800/api/admin/markets").rstrip("/")
 ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "").strip()
 
@@ -74,7 +74,7 @@ def weighted_allocate(symbols, scores):
     return [{"symbol": sym, "allocationPct": pct} for sym, pct in zip(symbols, rounded)]
 
 
-def _market_payload_from_outcomes(run_id: str, outcomes: list, title: str, description: str, source_link: str = "") -> dict:
+def _market_payload_from_outcomes(run_id: str, outcomes: list, title: str, description: str, source_link: str = "", headline: str = "") -> dict:
     mapped_outcomes = []
     for outcome in outcomes:
         basket_data = outcome.get("quantumBasket") or outcome.get("classicalBasket") or {}
@@ -105,7 +105,7 @@ def _market_payload_from_outcomes(run_id: str, outcomes: list, title: str, descr
 
     return {
         "eventId": run_id,
-        "headline": title,
+        "headline": headline or title,
         "title": title,
         "description": description,
         "sourceLink": source_link,
@@ -114,6 +114,65 @@ def _market_payload_from_outcomes(run_id: str, outcomes: list, title: str, descr
         "closesAt": closes_at,
         "brokerMode": "mock"
     }
+
+def run_quantum_streaming(title, description, basket_size=4, depth="tree", poll_interval=0.4):
+    """Non-blocking start + poll + fetch pattern matching admin-live flow.
+    
+    POST /runs/start → poll GET /runs/{id}/events?since=N → GET /runs/{id}.
+    Returns the same shape as the old blocking POST /runs call.
+    """
+    url_base = f"{QUANTUM_BASE_URL}/runs"
+    payload = {"basketSize": basket_size, "depth": depth, "description": description, "title": title}
+
+    # 1. Kick off the run (non-blocking)
+    start_resp = requests.post(f"{url_base}/start", json=payload, headers=_headers(), timeout=30)
+    if start_resp.status_code not in (200, 201):
+        raise RuntimeError(f"Quantum run start failed ({start_resp.status_code}): {start_resp.text}")
+    run_id = start_resp.json()["runId"]
+
+    # 2. Poll for progress events
+    cursor = 0
+    while True:
+        ev_resp = requests.get(f"{url_base}/{run_id}/events?since={cursor}", headers=_headers(), timeout=15)
+        if ev_resp.status_code != 200:
+            time.sleep(poll_interval)
+            continue
+        body = ev_resp.json()
+        for ev in body.get("events", []):
+            ev_type = ev["type"]
+            pl = ev.get("payload", {})
+            if ev_type == "analysis.done":
+                themes = ", ".join(pl.get("themes", []))
+                print(f"  → Themes: {themes} · Horizon: {pl.get('horizon', '')} · Sentiment: {pl.get('sentiment', '')}")
+            elif ev_type == "scenario.discovered":
+                print(f"  → Scenario: {pl.get('name', '')} ({pl.get('probability', 0) * 100:.0f}%)")
+            elif ev_type == "mapping.done":
+                cand = pl.get("candidates", [])
+                print(f"  → {len(cand)} candidates scored")
+            elif ev_type == "solver.classical.done":
+                basket = pl.get("basket", [])
+                print(f"  → Classical basket: {basket}")
+            elif ev_type == "solver.quantum.done":
+                basket = pl.get("basket", [])
+                print(f"  → Quantum basket:  {basket}")
+            elif ev_type == "run.error":
+                err = pl.get("error", "unknown error")
+                raise RuntimeError(f"Quantum run failed: {err}")
+
+        cursor = body.get("nextCursor", cursor)
+        if body.get("done"):
+            break
+        time.sleep(poll_interval)
+
+    # 3. Fetch the final cached result
+    run_resp = requests.get(f"{url_base}/{run_id}", headers=_headers(), timeout=15)
+    if run_resp.status_code != 200:
+        raise RuntimeError(f"Failed to fetch Quantum run result ({run_resp.status_code}): {run_resp.text}")
+    run_data = run_resp.json()
+    total_s = (run_data.get("outcomes", [None]) or [{}])[0].get("quantumBasket", {}).get("durationMs", 0) / 1000
+    print(f"  → Pipeline complete ({total_s:.1f}s)")
+    return run_data
+
 
 def chunk_list(lst, n):
     for i in range(0, len(lst), n):
@@ -350,42 +409,57 @@ Task: Build a single Cascade prediction-market event for an isolated target stor
 It is better to reject with worthy=false than to generate a mediocre event.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-TITLE PHILOSOPHY
+NEWS HEADLINE RULES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-The title is what a user reads before deciding to Buy or Sell.
-It must NOT sound like a financial research headline or an analyst report.
-It must sound like a plain-English market intuition a smart person would say.
+The news headline is a short summary of the original news. It must reflect the source article, not the market theme.
 
-TITLE PATTERN:
-  [Country / Region / Trend / Named Actor] + [market or behavior reaction] + [natural direction phrase]
+RULES:
+- Extract a concise news headline from the target article (45–70 characters recommended, max 86)
+- Must fit within 2–3 lines on mobile
+- Must be factual and grounded in the article, not speculative
+- Do NOT include market predictions or trading signals in the headline
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SUMMARY RULES (maps to "description" field)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The summary explains why the news may affect the market.
+
+RULES:
+- 1–2 sentences only (80–120 characters recommended, max 150)
+- MUST cite at least 1 concrete fact from the snippet
+- MUST explain the mechanism: how the real-world event flows through to the asset price
+- MUST NOT invent numbers or claims not present in the snippet
+- Keep it concise — this is not a detailed analysis, just why the market should care
+- Final sentence should connect to directional price movement
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUESTION RULES (maps to "title" field)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The question is what a user reads before deciding to Buy or Sell.
+It must NOT sound like a financial research headline or repeat the news text.
+It must convert the news into a market-prediction question users can answer intuitively.
+
+QUESTION PATTERN:
+  "Will [subject] [continue to / keep / move] [direction] [context]?"
 
 GOOD EXAMPLES (use this register and style):
-  - Middle East Tension Could Push Oil Higher
-  - US-China Tariff Escalation Could Weaken Asian Supply Chains
-  - Japan Fiscal Concerns Could Pressure JPY Lower
-  - Fed Rate Uncertainty Could Keep Gold Elevated
-  - Iran Conflict Risk Could Lift Defense Spending
-  - Meta Workforce Cuts Could Expand Operating Margins
-  - Red Sea Disruption Could Keep Shipping Costs High
-  - AI Copyright Pressure Could Raise Content Licensing Costs
-  - Trump AI Security Order Could Benefit Cloud Security Leaders
+  - Will demand for nuclear energy continue to rise as AI increases electricity usage?
+  - Will investor attention toward Middle East energy stocks increase?
+  - Will Fed rate uncertainty keep gold elevated?
+  - Will Iran conflict risk lift defense spending?
+  - Will Meta workforce cuts expand operating margins?
+  - Will AI copyright pressure raise content licensing costs?
 
-TITLE RULES — all must hold or set worthy=false:
-- Use the pattern above: subject + reaction + direction
-- Direction phrase MUST use soft modal language: "Could", "May", "Likely to" — NOT "Will"
+QUESTION RULES — all must hold or set worthy=false:
+- Must be a question (starts with "Will" or "Is")
+- Must be 65–100 characters recommended, max 120
+- Do NOT copy the news text directly into the question — convert it into a market prediction
+- Do NOT use direct Yes/No phrasing like "Do you think X happened?"
+- Direction phrase MUST use soft modal language: "continue to", "keep", "move" — NOT "Will" as a statement
 - BANNED openers: "Market Reaction to", "Impact of", "Effect of", "Outlook for", "Analysis of"
-- BANNED: price targets, percentages, "Cross X by Y", ticker symbols in the title
+- BANNED: price targets, percentages, ticker symbols in the question
 - The subject MUST be a real named entity, country, region, trend, or sector — not a generic placeholder
-- A reader should instantly understand: What is happening? Which way is the market likely to move?
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DESCRIPTION RULES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Minimum 5 dense, information-rich sentences — no filler or padding
-- MUST cite at least 2 concrete facts from the snippet: named individuals, dollar amounts, percentages, vote counts, dates, or specific data points
-- MUST explain the step-by-step mechanism: how the real-world event flows through to the asset price
-- MUST NOT invent numbers or claims not present in the snippet or price context
-- Final sentence MUST state precise binary resolution terms: specific price level, direction, and weekly timeframe
+- Connect the question to concepts: price rising/falling, demand increasing/decreasing, attention strengthening/weakening
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WORTHY GATE & EVALUATION LAYER
@@ -397,7 +471,7 @@ Evaluate the event strictly across four pillars:
 4. Worthiness Assessment: Is this event important enough for downstream trading?
 
 If ALL four pillars pass, set decision_approved=true. Otherwise, decision_approved=false.
-Set worthy=false if decision_approved=false, OR if any title/description rules fail.
+Set worthy=false if decision_approved=false, OR if any headline/summary/question rules fail.
 Honest tradability_score MUST be above 0.80 to be worthy.
 
 CAUSAL CHAIN: Provide a compact "Real-World Trigger -> Market Mechanism -> Asset Direction" string."""
@@ -429,13 +503,17 @@ Target Asset Mapping:
 - Preliminary Directional Thesis: {thesis}
 - Current Web Price Context: {asset_price_info}
 
-Apply ALL title, description, and worthy rules from the system instruction before writing your response.
+Apply ALL headline, summary, question, and worthy rules from the system instruction before writing your response.
 If ANY quality gate fails, still return the full JSON but set worthy=false with your honest tradability_score.
 
-TITLE REMINDER — follow this pattern exactly:
-  [Country/Region/Trend/Named Actor] + [market or behavior reaction] + [soft directional phrase: Could/May/Likely to]
-  Example: "Meta Workforce Cuts Could Expand Operating Margins"
-  NOT: "Market Reaction to Meta's Layoffs" or "Impact of Meta Cost Reduction"
+QUESTION REMINDER:
+- Must be a question starting with "Will" or "Is" (65–100 chars recommended, max 120)
+- Example: "Will demand for nuclear energy continue to rise as AI increases electricity usage?"
+- NOT: "Meta Workforce Cuts Could Expand Operating Margins" (this is a statement, not a question)
+
+SUMMARY REMINDER:
+- 1–2 sentences (80–120 chars recommended, max 150)
+- NOT a multi-paragraph analysis
 
 Output strict JSON matching schema:
 {{
@@ -446,9 +524,10 @@ Output strict JSON matching schema:
   "worthiness_assessment": true,
   "decision_approved": true,
   "worthy": true,
-  "title": "<[Subject] + [reaction] + [Could/May/Likely to + direction] — plain English, no tickers, no price targets>",
+  "headline": "<45-70 character news headline from the article — factual, not speculative, max 86>",
+  "title": "<Market question: Will [subject] [direction] [context]? — 65-100 chars, max 120>",
   "causal_chain": "<Real-World Trigger -> Market Mechanism -> Asset Direction>",
-  "description": "<5+ dense sentences: 2+ named facts from snippet, mechanism explanation, binary resolution terms with specific price and weekly timeframe>",
+  "description": "<1-2 sentence market impact summary — 80-120 chars, max 150>",
   "linked_assets": ["{ticker}"],
   "directional_impact": "<Bullish|Bearish|Volatile>",
   "category": "Macroeconomics",
@@ -519,16 +598,13 @@ Output strict JSON matching schema:
                 continue
             try:
                 print(f" -> Running pipeline for event: {title[:90]}")
-                run_payload = {"basketSize": 4, "depth": "tree", "description": description, "title": title}
-                run_resp = requests.post(QUANTUM_API_URL, json=run_payload, headers=_headers(), timeout=120)
-                if run_resp.status_code not in (200, 201):
-                    raise RuntimeError(f"Quantum run failed ({run_resp.status_code}): {run_resp.text}")
-                run_data = run_resp.json()
+                run_data = run_quantum_streaming(title, description, basket_size=4, depth="tree")
                 market_payload = _market_payload_from_outcomes(
                     run_data.get("runId", ""),
                     run_data.get("outcomes", []),
                     title, description,
-                    source_link=event.get("source_story_id", "")
+                    source_link=event.get("source_story_id", ""),
+                    headline=event.get("headline", "")
                 )
                 resp = requests.post(MARKETS_API_URL, json=market_payload, headers=_headers(), timeout=30)
                 if resp.status_code in (200, 201):
