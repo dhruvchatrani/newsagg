@@ -10,7 +10,8 @@ from dotenv import load_dotenv
 env_path = Path(__file__).resolve().parent / '.env'
 load_dotenv(dotenv_path=env_path, override=True)
 
-QUANTUM_API_URL = os.getenv("QUANTUM_API_URL", "http://localhost:3002").rstrip("/")
+_q_base = os.getenv("QUANTUM_API_URL", "http://localhost:3002").rstrip("/").removesuffix("/runs")
+QUANTUM_API_URL = _q_base + "/runs"
 MARKETS_API_URL = os.getenv("MARKETS_API_URL", "http://localhost:8800/api/admin/markets").rstrip("/")
 
 # Fetch token if needed, otherwise it sends without auth
@@ -106,7 +107,7 @@ def push_events(file_path="prediction_events.json"):
     print(f"\n[Step 1] Running Quantum pipeline for event: {title}")
     run_payload = {"basketSize": 4, "depth": "tree", "description": description, "title": title}
     try:
-        resp = requests.post(f"{QUANTUM_API_URL}/runs", json=run_payload, headers=headers, timeout=120)
+        resp = requests.post(QUANTUM_API_URL, json=run_payload, headers=headers, timeout=120)
         if resp.status_code not in (200, 201):
             print(f"Quantum run failed ({resp.status_code}): {resp.text}")
             return

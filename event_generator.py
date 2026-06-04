@@ -10,7 +10,8 @@ import config
 _env_path = Path(__file__).resolve().parent / '.env'
 load_dotenv(dotenv_path=_env_path, override=True)
 
-QUANTUM_API_URL = os.getenv("QUANTUM_API_URL", "http://localhost:3002/runs").rstrip("/")
+_quantum_base = os.getenv("QUANTUM_API_URL", "http://localhost:3002").rstrip("/").removesuffix("/runs")
+QUANTUM_API_URL = _quantum_base + "/runs"
 MARKETS_API_URL = os.getenv("MARKETS_API_URL", "http://localhost:8800/api/admin/markets").rstrip("/")
 ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "").strip()
 
