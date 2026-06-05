@@ -11,9 +11,14 @@ import config
 _env_path = Path(__file__).resolve().parent / '.env'
 load_dotenv(dotenv_path=_env_path, override=True)
 
-QUANTUM_BASE_URL = os.getenv("QUANTUM_API_URL", "http://localhost:3002").rstrip("/").removesuffix("/runs")
-MARKETS_API_URL = os.getenv("MARKETS_API_URL", "http://localhost:8800/api/admin/markets").rstrip("/")
+QUANTUM_BASE_URL = os.getenv("QUANTUM_API_URL", "https://blackbox-quantum.bitzaurus.com").rstrip("/").removesuffix("/runs")
+MARKETS_API_URL = os.getenv("MARKETS_API_URL",  "https://api.bitzaurus.com/api/admin/markets").rstrip("/")
 ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "").strip()
+
+_here = Path(__file__).resolve().parent
+IC_SYMBOL_MAP = json.loads((_here / "ic_symbol_map.json").read_text())
+IC_UNIVERSE = set(json.loads((_here / "ic_universe.json").read_text()))
+VANTAGE_UNIVERSE = set(json.loads((_here / "vantage_universe.json").read_text()))
 
 def _headers() -> dict:
     h = {"Content-Type": "application/json"}
@@ -74,7 +79,16 @@ def weighted_allocate(symbols, scores):
     return [{"symbol": sym, "allocationPct": pct} for sym, pct in zip(symbols, rounded)]
 
 
-def _market_payload_from_outcomes(run_id: str, outcomes: list, title: str, description: str, source_link: str = "", headline: str = "") -> dict:
+def _filter_and_map_symbols(symbols, scores_map, broker_mode):
+    if broker_mode == "ic":
+        mapped = [(IC_SYMBOL_MAP.get(s, s), scores_map.get(s, 0.5)) for s in symbols]
+        return [(s, sc) for s, sc in mapped if s in IC_UNIVERSE]
+    elif broker_mode == "vantage":
+        return [(s, scores_map.get(s, 0.5)) for s in symbols if s in VANTAGE_UNIVERSE]
+    return [(s, scores_map.get(s, 0.5)) for s in symbols]
+
+
+def _market_payload_from_outcomes(run_id: str, outcomes: list, title: str, description: str, source_link: str = "", headline: str = "", broker_mode: str = "mock") -> dict:
     mapped_outcomes = []
     for outcome in outcomes:
         basket_data = outcome.get("quantumBasket") or outcome.get("classicalBasket") or {}
@@ -83,8 +97,11 @@ def _market_payload_from_outcomes(run_id: str, outcomes: list, title: str, descr
             continue
 
         candidate_scores = {c["symbol"]: c["score"] for c in outcome.get("candidates", [])}
-        scores = [candidate_scores.get(sym, 0.5) for sym in selected_symbols]
-        allocations = weighted_allocate(selected_symbols, scores)
+        filtered = _filter_and_map_symbols(selected_symbols, candidate_scores, broker_mode)
+        if not filtered:
+            continue
+        mapped_symbols, scores = zip(*filtered)
+        allocations = weighted_allocate(list(mapped_symbols), list(scores))
 
         mapped_stocks = []
         for alloc in allocations:
@@ -112,7 +129,7 @@ def _market_payload_from_outcomes(run_id: str, outcomes: list, title: str, descr
         "outcomes": mapped_outcomes,
         "opensAt": now_iso,
         "closesAt": closes_at,
-        "brokerMode": "mock"
+        "brokerMode": broker_mode
     }
 
 def run_quantum_streaming(title, description, basket_size=4, depth="tree", poll_interval=0.4):
@@ -133,7 +150,7 @@ def run_quantum_streaming(title, description, basket_size=4, depth="tree", poll_
     # 2. Poll for progress events
     cursor = 0
     while True:
-        ev_resp = requests.get(f"{url_base}/{run_id}/events?since={cursor}", headers=_headers(), timeout=150)
+        ev_resp = requests.get(f"{url_base}/{run_id}/events?since={cursor}", headers=_headers(), timeout=1200)
         if ev_resp.status_code != 200:
             time.sleep(poll_interval)
             continue
@@ -165,7 +182,7 @@ def run_quantum_streaming(title, description, basket_size=4, depth="tree", poll_
         time.sleep(poll_interval)
 
     # 3. Fetch the final cached result
-    run_resp = requests.get(f"{url_base}/{run_id}", headers=_headers(), timeout=150)
+    run_resp = requests.get(f"{url_base}/{run_id}", headers=_headers(), timeout=450)
     if run_resp.status_code != 200:
         raise RuntimeError(f"Failed to fetch Quantum run result ({run_resp.status_code}): {run_resp.text}")
     run_data = run_resp.json()
@@ -246,7 +263,7 @@ def call_gemini_api(system_instruction: str, user_prompt: str) -> dict:
             "responseMimeType": "application/json"
         }
     }
-    response = requests.post(url, json=payload, headers=headers, timeout=600)
+    response = requests.post(url, json=payload, headers=headers, timeout=1200)
     if response.status_code == 200:
         resp_json = response.json()
         text = resp_json["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -254,13 +271,18 @@ def call_gemini_api(system_instruction: str, user_prompt: str) -> dict:
     else:
         raise Exception(f"Gemini API error {response.status_code}: {response.text}")
 
-def generate_events(news_file="news_database.json", assets_file="assets.json", max_events=15, articles=None):
-    try:
-        with open(assets_file, 'r') as f:
-            universe = json.load(f)
-    except Exception as e:
-        print(f"Error loading files: {e}")
-        return False
+def generate_events(news_file="news_database.json", assets_file="assets.json", max_events=15, articles=None, broker_mode="ic"):
+    if broker_mode == "vantage":
+        universe = list(VANTAGE_UNIVERSE)
+    elif broker_mode == "ic":
+        universe = list(IC_UNIVERSE)
+    else:
+        try:
+            with open(assets_file, 'r') as f:
+                universe = json.load(f)
+        except Exception as e:
+            print(f"Error loading files: {e}")
+            return False
 
     if articles is None:
         try:
@@ -604,7 +626,8 @@ Output strict JSON matching schema:
                     run_data.get("outcomes", []),
                     title, description,
                     source_link=event.get("source_story_id", ""),
-                    headline=event.get("headline", "")
+                    headline=event.get("headline", ""),
+                    broker_mode=broker_mode
                 )
                 resp = requests.post(MARKETS_API_URL, json=market_payload, headers=_headers(), timeout=300)
                 if resp.status_code in (200, 201):

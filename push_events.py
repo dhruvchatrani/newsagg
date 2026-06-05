@@ -103,7 +103,7 @@ def push_events(
 
     print(f"\n[Step 1] Running Quantum pipeline for event: {title}")
     run_payload = {"basketSize": basket_size, "depth": depth, "description": description, "title": title}
-    resp = requests.post(QUANTUM_API_URL, json=run_payload, headers=_headers(), timeout=120)
+    resp = requests.post(QUANTUM_API_URL, json=run_payload, headers=_headers(), timeout=None)
     if resp.status_code not in (200, 201):
         print(f"Quantum run failed ({resp.status_code}): {resp.text}")
         return
